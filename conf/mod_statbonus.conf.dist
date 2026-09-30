@@ -3,27 +3,40 @@
 ########################################
 # mod-statbonus configuration
 #
-# Permanent flat additions to a character's five primary stats, held in
-# `character_stat_bonus` in the characters database and applied at the last
-# moment of the stat calculation, so they present as base stat: white text on
-# the character sheet, no buff icon, and everything derived from the stat
-# (health from stamina, spell power from intellect) follows.
+# Permanent flat additions to a character's five primary stats and its
+# twenty-five combat ratings, held in `character_stat_bonus` in the characters
+# database.
 #
-#   .statbonus add <player> <stat> <amount>     add to what they already have
-#   .statbonus set <player> <stat> <amount>     set the total outright
-#   .statbonus clear <player> [stat]            one stat, or all five
+# A stat bonus presents as base stat: white text on the character sheet, no buff
+# icon, and everything derived from the stat (health from stamina, spell power
+# from intellect) follows. A rating bonus goes in where gear puts its ratings,
+# so hit, expertise, dodge, parry, crit, haste and the rest are
+# indistinguishable from the same amount off an item - including haste actually
+# making the character swing and cast faster.
+#
+#   .statbonus add <player> <what> <amount>     add to what they already have
+#   .statbonus set <player> <what> <amount>     set the total outright
+#   .statbonus clear <player> [what]            one bonus, or all of them
 #   .statbonus list [player]                    the realm, or one character
+#   .statbonus names                            everything <what> accepts
 #   .statbonus reload                           re-read the table
 #
-# <stat> is strength, agility, stamina, intellect or spirit (str/agi/sta/int/
-# spi also work, as does the raw index 0-4). <amount> may be negative. The
-# stat shown to the client is floored at zero however negative the bonus.
+# <what> is strength, agility, stamina, intellect or spirit, or a rating:
+# dodge, parry, block, hit, crit, haste, expertise, defense,
+# armor_penetration, the _ranged and _spell forms of hit/crit/haste, the
+# hit_taken and crit_taken ones, and the weapon skills. Abbreviations
+# (str/agi/arp/melee_hit) work, and stat:<n> / rating:<n> address the core's
+# enums by index. A bare number is refused, because it would have to mean
+# either a stat or a rating and either reading is wrong half the time.
+#
+# <amount> may be negative. A shown stat is floored at zero however negative
+# the bonus, because the field itself is unsigned.
 #
 # Grants apply to offline characters too, and take effect at their next login.
 ########################################
 #
 #    StatBonus.Enable
-#        Description: Apply granted stat bonuses.
+#        Description: Apply granted bonuses.
 #                     Turning this off leaves the grants in the table but stops
 #                     them counting, which is the quickest way to tell whether
 #                     something odd on a character is coming from this module.
@@ -35,14 +48,20 @@ StatBonus.Enable = 1
 #
 #    StatBonus.Limit
 #        Description: Largest absolute bonus the commands will write to one
-#                     stat. A limit of 50 permits -50 as well, and a request
+#                     stat or rating. A limit of 50 permits -50, and a request
 #                     beyond it is clamped rather than refused, with the clamp
 #                     reported back.
 #
 #                     This guards against a mistyped amount, not against the
 #                     grants themselves - a bonus is flat and stacks with gear
 #                     without any cap of its own, so a stray extra digit is
-#                     otherwise a character with 3000 strength.
+#                     otherwise a character with 3000 strength, or one who
+#                     never misses.
+#
+#                     One number covers both kinds, and they are not on the
+#                     same scale: a rating worth having is tens or hundreds of
+#                     points where a stat is single digits. Set it for the
+#                     ratings and grant stats well under it.
 #        Default:     0 - (No limit)
 
 StatBonus.Limit = 0

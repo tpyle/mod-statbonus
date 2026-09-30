@@ -1,9 +1,9 @@
 /*
- * mod-statbonus - permanent flat additions to a character's primary stats
+ * mod-statbonus - permanent flat additions to a character's stats and ratings
  *
- * The question this answers is "can a character be given +1 strength for good,
- * without an item and without a buff". Everything the server already offers
- * says no in some way:
+ * The question this answers is "can a character be given +1 strength, or 20 hit
+ * rating, for good, without an item and without a buff". Everything the server
+ * already offers says no in some way:
  *
  *   - Gear and enchants are the intended route, and they leave when the item
  *     does.
@@ -13,21 +13,40 @@
  *     spell refresh rather than stack because StackAmount is 0.
  *   - Writing the create stats directly does present as base stat, and is then
  *     thrown away: InitStatsForLevel rewrites them from player_class_stats and
- *     player_race_stats at every login and every level-up.
+ *     player_race_stats at every login and on every level-up.
  *
- * So the bonus is not stored on the character at all. It is applied at the last
- * moment of the calculation, through a core hook added for it:
+ * The two kinds of bonus reach the character by different routes, because the
+ * server holds them differently.
  *
- *   value = ((BASE_VALUE * BASE_PCT) + TOTAL_VALUE) * TOTAL_PCT
- *   -> OnPlayerCalculateStat(player, stat, value)      <- here
- *   -> SetStat(stat, int32(value))
+ * PRIMARY STATS go through a hook added to the core for it, at the last moment
+ * of the calculation:
+ *
+ *     value = ((BASE_VALUE * BASE_PCT) + TOTAL_VALUE) * TOTAL_PCT
+ *     -> OnPlayerCalculateStat(player, stat, value)     <- here
+ *     -> SetStat(stat, int32(value))
  *
  * That fires on every recalculation - login, level-up, equipping, any aura
  * change - so the module answers with the character's current bonus each time
- * and never has to re-apply anything. Because it lands before SetStat and after
- * everything else, the client shows it as base stat, white text, with no buff
- * icon, and the derived stats that read the stat field (health from stamina,
- * spell power from intellect, and so on) pick it up for free.
+ * and never has to re-apply anything. Landing there is what makes it read as
+ * base stat: white text on the character sheet, no buff icon, and everything
+ * derived from the stat field (health from stamina, spell power from intellect,
+ * attack power from strength) picks it up for free.
+ *
+ * COMBAT RATINGS go through Player::ApplyRatingMod, which is where gear puts
+ * them, rather than through a second hook of the same shape. The reason is
+ * haste: CR_HASTE_MELEE, _RANGED and _SPELL only affect attack and cast speed
+ * because ApplyRatingMod reaches into ApplyAttackTimePercentMod and
+ * ApplyCastTimePercentMod as it changes m_baseRatingValue. A hook inside
+ * UpdateRating - which is where the equivalent last-moment hook would have to
+ * go - would put the number on the sheet and leave the character no faster.
+ *
+ * That makes ratings applied state, which is exactly what was avoided for the
+ * stats, so it is worth saying why it is safe here: nothing resets
+ * m_baseRatingValue mid-session. Item mods add and subtract their own deltas
+ * rather than rebuilding the array, and there is no rating equivalent of
+ * InitStatsForLevel. So the module applies its ratings once at login and
+ * reconciles on a change, keeping a record of what it has actually pushed in so
+ * a re-grant or a reload moves by the difference rather than stacking.
  */
 
 #include "StatBonusStore.h"
@@ -38,12 +57,15 @@
 #include "DatabaseEnv.h"
 #include "Language.h"
 #include "Log.h"
+#include "ObjectAccessor.h"
 #include "Player.h"
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
 #include "StringFormat.h"
+#include "Unit.h"
 
 #include <string>
+#include <unordered_map>
 
 using namespace Acore::ChatCommands;
 
@@ -51,12 +73,17 @@ namespace
 {
     struct Config
     {
-        bool   Enable = true;
-        int32  Limit  = 0;   // 0 = no limit
+        bool  Enable = true;
+        int32 Limit  = 0;   // 0 = no limit
     };
 
     Config cfg;
     StatBonus::Store store;
+
+    // What this module has actually pushed into each online character's
+    // m_baseRatingValue, so a change moves by the difference. Cleared on
+    // logout; the ratings themselves go with the session.
+    std::unordered_map<uint32, std::array<int32, StatBonus::RATING_COUNT>> applied;
 
     void LoadConfig()
     {
@@ -64,15 +91,59 @@ namespace
         cfg.Limit  = sConfigMgr->GetOption<int32>("StatBonus.Limit", 0);
     }
 
+    // Bring a connected character's ratings in line with the store, by the
+    // difference. Also the revert path: with the module disabled, or every
+    // grant cleared, the desired amount is zero and this takes the ratings back
+    // out again.
+    void ReconcileRatings(Player* player)
+    {
+        if (!player)
+            return;
+
+        uint32 const guid = player->GetGUID().GetCounter();
+
+        StatBonus::Bonuses const* bonuses = cfg.Enable ? store.Find(guid) : nullptr;
+        auto const it = applied.find(guid);
+
+        if (!bonuses && it == applied.end())
+            return;
+
+        std::array<int32, StatBonus::RATING_COUNT>& have =
+            it != applied.end() ? it->second : applied[guid];
+
+        bool anyLeft = false;
+
+        for (std::size_t rating = 0; rating < StatBonus::RATING_COUNT; ++rating)
+        {
+            int32 const want  = bonuses ? (*bonuses)[StatBonus::RatingSlot(rating)] : 0;
+            int32 const delta = want - have[rating];
+
+            if (delta)
+            {
+                // A signed value with apply=true is how ApplyRatingMod takes a
+                // decrease as well; the haste branch reads the old and new
+                // totals either way round.
+                player->ApplyRatingMod(CombatRating(rating), delta, true);
+                have[rating] = want;
+            }
+
+            if (want)
+                anyLeft = true;
+        }
+
+        if (!anyLeft)
+            applied.erase(guid);
+    }
+
     // Returns the number of rows kept.
     uint32 LoadBonuses()
     {
         store.Reset();
 
-        QueryResult result = CharacterDatabase.Query("SELECT `Guid`, `Stat`, `Amount` FROM `character_stat_bonus`");
+        QueryResult result = CharacterDatabase.Query("SELECT `Guid`, `Kind`, `Id`, `Amount` FROM `character_stat_bonus`");
         if (!result)
         {
-            LOG_INFO("module", "mod-statbonus: no stat bonuses are granted.");
+            LOG_INFO("module", "mod-statbonus: no bonuses are granted.");
             return 0;
         }
 
@@ -84,12 +155,15 @@ namespace
             Field* fields = result->Fetch();
 
             uint32 const guid   = fields[0].Get<uint32>();
-            uint8  const stat   = fields[1].Get<uint8>();
-            int32  const amount = fields[2].Get<int32>();
+            uint8  const kind   = fields[1].Get<uint8>();
+            uint8  const id     = fields[2].Get<uint8>();
+            int32  const amount = fields[3].Get<int32>();
 
-            if (stat >= StatBonus::STAT_COUNT)
+            auto const slot = StatBonus::SlotOf(kind, id);
+            if (!slot)
             {
-                LOG_ERROR("module", "mod-statbonus: character {} has a bonus for stat {}, which is not a stat; skipped.", guid, stat);
+                LOG_ERROR("module", "mod-statbonus: character {} has a bonus for kind {} id {}, which is not a stat or a rating; skipped.",
+                    guid, kind, id);
                 ++skipped;
                 continue;
             }
@@ -97,34 +171,41 @@ namespace
             if (amount == 0)
                 continue;
 
-            store.Set(guid, stat, amount);
+            store.Set(guid, *slot, amount);
             ++kept;
         } while (result->NextRow());
 
-        LOG_INFO("module", "mod-statbonus: loaded {} stat bonus(es) for {} character(s){}.",
+        LOG_INFO("module", "mod-statbonus: loaded {} bonus(es) for {} character(s){}.",
             kept, store.Size(), skipped ? Acore::StringFormat(", skipped {} bad row(s)", skipped) : "");
 
         return kept;
     }
 
-    void Persist(uint32 guid, std::size_t stat, int32 amount)
+    void Persist(uint32 guid, std::size_t slot, int32 amount)
     {
+        uint32 const kind = StatBonus::KindOf(slot);
+        uint32 const id   = StatBonus::IndexOf(slot);
+
         if (amount == 0)
         {
-            CharacterDatabase.Execute("DELETE FROM `character_stat_bonus` WHERE `Guid` = {} AND `Stat` = {}", guid, uint32(stat));
+            CharacterDatabase.Execute("DELETE FROM `character_stat_bonus` WHERE `Guid` = {} AND `Kind` = {} AND `Id` = {}",
+                guid, kind, id);
             return;
         }
 
-        CharacterDatabase.Execute("REPLACE INTO `character_stat_bonus` (`Guid`, `Stat`, `Amount`) VALUES ({}, {}, {})",
-            guid, uint32(stat), amount);
+        CharacterDatabase.Execute("REPLACE INTO `character_stat_bonus` (`Guid`, `Kind`, `Id`, `Amount`) VALUES ({}, {}, {}, {})",
+            guid, kind, id, amount);
     }
 
-    // The character sheet only changes when the stats are recalculated, and the
-    // hook is not going to fire on its own for a character standing still.
+    // The character sheet only changes when the numbers are recalculated, and
+    // neither route fires on its own for a character standing still.
     void Refresh(Player* player)
     {
-        if (player)
-            player->UpdateAllStats();
+        if (!player)
+            return;
+
+        ReconcileRatings(player);
+        player->UpdateAllStats();
     }
 }
 
@@ -154,7 +235,11 @@ class StatBonus_PlayerScript : public PlayerScript
 {
 public:
     StatBonus_PlayerScript() : PlayerScript("StatBonus_PlayerScript",
-        { PLAYERHOOK_ON_CALCULATE_STAT }) { }
+        {
+            PLAYERHOOK_ON_CALCULATE_STAT,
+            PLAYERHOOK_ON_LOGIN,
+            PLAYERHOOK_ON_LOGOUT
+        }) { }
 
     void OnPlayerCalculateStat(Player* player, Stats stat, float& value) override
     {
@@ -169,6 +254,20 @@ public:
             return;
 
         value = StatBonus::Apply(value, bonus);
+    }
+
+    void OnPlayerLogin(Player* player) override
+    {
+        // Ratings are applied state and go with the session, so they are put
+        // back on at every login. Stats need nothing here - their hook has
+        // already fired several times by this point.
+        if (store.AnyRatings())
+            ReconcileRatings(player);
+    }
+
+    void OnPlayerLogout(Player* player) override
+    {
+        applied.erase(player->GetGUID().GetCounter());
     }
 };
 
@@ -185,6 +284,7 @@ public:
             { "set",    HandleStatBonusSetCommand,    SEC_ADMINISTRATOR, Console::Yes },
             { "clear",  HandleStatBonusClearCommand,  SEC_ADMINISTRATOR, Console::Yes },
             { "list",   HandleStatBonusListCommand,   SEC_GAMEMASTER,    Console::Yes },
+            { "names",  HandleStatBonusNamesCommand,  SEC_GAMEMASTER,    Console::Yes },
             { "reload", HandleStatBonusReloadCommand, SEC_ADMINISTRATOR, Console::Yes }
         };
 
@@ -199,59 +299,101 @@ public:
     static bool HandleStatBonusReloadCommand(ChatHandler* handler)
     {
         uint32 const count = LoadBonuses();
-        handler->PSendSysMessage("mod-statbonus: reloaded {} bonus(es) for {} character(s). Online characters refresh on their next stat update.",
-            count, store.Size());
+
+        // Ratings are applied state, so a reload has to walk the characters
+        // that are already on and move them to whatever the table now says.
+        //
+        // ObjectAccessor rather than WorldSessionMgr::GetAllSessions(), which
+        // looks like the obvious choice and is wrong on a playerbot realm:
+        // mod-playerbots never calls AddSession for its fabricated sessions, so
+        // that map holds only the real clients - "Connection peak: 0" with 500
+        // bots in the world - and this loop reported refreshing nobody.
+        uint32 reconciled = 0;
+        for (auto const& [guid, player] : ObjectAccessor::GetPlayers())
+        {
+            if (!player || !player->IsInWorld())
+                continue;
+
+            ReconcileRatings(player);
+            player->UpdateAllStats();
+            ++reconciled;
+        }
+
+        handler->PSendSysMessage("mod-statbonus: reloaded {} bonus(es) for {} character(s); refreshed {} online.",
+            count, store.Size(), reconciled);
         return true;
     }
 
-    static bool HandleStatBonusAddCommand(ChatHandler* handler, Optional<PlayerIdentifier> target, std::string statName, int32 amount)
+    static bool HandleStatBonusNamesCommand(ChatHandler* handler)
     {
-        return Grant(handler, std::move(target), statName, amount, true);
+        handler->PSendSysMessage("Primary stats:");
+        std::string line;
+        for (std::size_t slot = 0; slot < StatBonus::STAT_COUNT; ++slot)
+            line += Acore::StringFormat("{}{}", line.empty() ? "  " : ", ", StatBonus::SlotName(slot));
+        handler->PSendSysMessage("{}", line);
+
+        handler->PSendSysMessage("Combat ratings:");
+        line.clear();
+        for (std::size_t slot = StatBonus::STAT_COUNT; slot < StatBonus::SLOT_COUNT; ++slot)
+        {
+            line += Acore::StringFormat("{}{}", line.empty() ? "  " : ", ", StatBonus::SlotName(slot));
+            if (line.size() > 150)
+            {
+                handler->PSendSysMessage("{}", line);
+                line.clear();
+            }
+        }
+        if (!line.empty())
+            handler->PSendSysMessage("{}", line);
+
+        handler->PSendSysMessage("Also str/agi/sta/int/spi, melee_hit, spell_crit, arp and similar, or stat:<n> / rating:<n> by enum index.");
+        return true;
     }
 
-    static bool HandleStatBonusSetCommand(ChatHandler* handler, Optional<PlayerIdentifier> target, std::string statName, int32 amount)
+    static bool HandleStatBonusAddCommand(ChatHandler* handler, Optional<PlayerIdentifier> target, std::string what, int32 amount)
     {
-        return Grant(handler, std::move(target), statName, amount, false);
+        return Grant(handler, std::move(target), what, amount, true);
     }
 
-    static bool HandleStatBonusClearCommand(ChatHandler* handler, Optional<PlayerIdentifier> target, Optional<std::string> statName)
+    static bool HandleStatBonusSetCommand(ChatHandler* handler, Optional<PlayerIdentifier> target, std::string what, int32 amount)
+    {
+        return Grant(handler, std::move(target), what, amount, false);
+    }
+
+    static bool HandleStatBonusClearCommand(ChatHandler* handler, Optional<PlayerIdentifier> target, Optional<std::string> what)
     {
         if (!Resolve(handler, target))
             return false;
 
         uint32 const guid = target->GetGUID().GetCounter();
 
-        if (statName)
+        if (what)
         {
-            auto const stat = StatBonus::ParseStat(*statName);
-            if (!stat)
-            {
-                handler->PSendSysMessage("Unknown stat \"{}\". Use strength, agility, stamina, intellect or spirit.", *statName);
-                handler->SetSentErrorMessage(true);
-                return false;
-            }
+            auto const slot = StatBonus::ParseSlot(*what);
+            if (!slot)
+                return Unknown(handler, *what);
 
-            if (!store.Clear(guid, *stat))
+            if (!store.Clear(guid, *slot))
             {
-                handler->PSendSysMessage("{} has no {} bonus to clear.", target->GetName(), StatBonus::StatName(*stat));
+                handler->PSendSysMessage("{} has no {} bonus to clear.", target->GetName(), StatBonus::SlotName(*slot));
                 return true;
             }
 
-            Persist(guid, *stat, 0);
+            Persist(guid, *slot, 0);
             Refresh(target->GetConnectedPlayer());
-            handler->PSendSysMessage("Cleared {}'s {} bonus.", target->GetName(), StatBonus::StatName(*stat));
+            handler->PSendSysMessage("Cleared {}'s {} bonus.", target->GetName(), StatBonus::SlotName(*slot));
             return true;
         }
 
         if (!store.Clear(guid))
         {
-            handler->PSendSysMessage("{} has no stat bonuses to clear.", target->GetName());
+            handler->PSendSysMessage("{} has no bonuses to clear.", target->GetName());
             return true;
         }
 
         CharacterDatabase.Execute("DELETE FROM `character_stat_bonus` WHERE `Guid` = {}", guid);
         Refresh(target->GetConnectedPlayer());
-        handler->PSendSysMessage("Cleared every stat bonus on {}.", target->GetName());
+        handler->PSendSysMessage("Cleared every bonus on {}.", target->GetName());
         return true;
     }
 
@@ -265,19 +407,12 @@ public:
         {
             if (store.Empty())
             {
-                handler->PSendSysMessage("No stat bonuses are granted.");
+                handler->PSendSysMessage("No bonuses are granted.");
                 return true;
             }
 
             for (auto const& [guid, bonuses] : store.All())
-            {
-                std::string line;
-                for (std::size_t i = 0; i < StatBonus::STAT_COUNT; ++i)
-                    if (bonuses[i])
-                        line += Acore::StringFormat("{}{:+d} {}", line.empty() ? "" : ", ", bonuses[i], StatBonus::StatName(i));
-
-                handler->PSendSysMessage("  guid {}: {}", guid, line);
-            }
+                handler->PSendSysMessage("  guid {}: {}", guid, Describe(bonuses));
 
             handler->PSendSysMessage("{} character(s) with bonuses.", store.Size());
             return true;
@@ -286,19 +421,32 @@ public:
         StatBonus::Bonuses const* bonuses = store.Find(target->GetGUID().GetCounter());
         if (!bonuses)
         {
-            handler->PSendSysMessage("{} has no stat bonuses.", target->GetName());
+            handler->PSendSysMessage("{} has no bonuses.", target->GetName());
             return true;
         }
 
-        handler->PSendSysMessage("Stat bonuses for {}:", target->GetName());
-        for (std::size_t i = 0; i < StatBonus::STAT_COUNT; ++i)
-            if ((*bonuses)[i])
-                handler->PSendSysMessage("  {:+d} {}", (*bonuses)[i], StatBonus::StatName(i));
-
+        handler->PSendSysMessage("Bonuses for {}: {}", target->GetName(), Describe(*bonuses));
         return true;
     }
 
 private:
+    static std::string Describe(StatBonus::Bonuses const& bonuses)
+    {
+        std::string out;
+        for (std::size_t slot = 0; slot < StatBonus::SLOT_COUNT; ++slot)
+            if (bonuses[slot])
+                out += Acore::StringFormat("{}{:+d} {}", out.empty() ? "" : ", ", bonuses[slot], StatBonus::SlotName(slot));
+
+        return out;
+    }
+
+    static bool Unknown(ChatHandler* handler, std::string const& what)
+    {
+        handler->PSendSysMessage("Unknown stat or rating \"{}\". \".statbonus names\" lists them.", what);
+        handler->SetSentErrorMessage(true);
+        return false;
+    }
+
     static bool Resolve(ChatHandler* handler, Optional<PlayerIdentifier>& target)
     {
         if (!target)
@@ -313,38 +461,39 @@ private:
         return true;
     }
 
-    static bool Grant(ChatHandler* handler, Optional<PlayerIdentifier> target, std::string const& statName, int32 amount, bool add)
+    static bool Grant(ChatHandler* handler, Optional<PlayerIdentifier> target, std::string const& what, int32 amount, bool add)
     {
         if (!Resolve(handler, target))
             return false;
 
-        auto const stat = StatBonus::ParseStat(statName);
-        if (!stat)
-        {
-            handler->PSendSysMessage("Unknown stat \"{}\". Use strength, agility, stamina, intellect or spirit.", statName);
-            handler->SetSentErrorMessage(true);
-            return false;
-        }
+        auto const slot = StatBonus::ParseSlot(what);
+        if (!slot)
+            return Unknown(handler, what);
 
         uint32 const guid = target->GetGUID().GetCounter();
 
-        int32 const wanted = add ? store.Get(guid, *stat) + amount : amount;
+        int32 const wanted = add ? store.Get(guid, *slot) + amount : amount;
         int32 const total  = StatBonus::ClampToLimit(wanted, cfg.Limit);
 
         if (total != wanted)
             handler->PSendSysMessage("Clamped to StatBonus.Limit ({}).", cfg.Limit);
 
-        store.Set(guid, *stat, total);
-        Persist(guid, *stat, total);
+        store.Set(guid, *slot, total);
+        Persist(guid, *slot, total);
         Refresh(target->GetConnectedPlayer());
 
         if (total == 0)
-            handler->PSendSysMessage("{} now has no {} bonus.", target->GetName(), StatBonus::StatName(*stat));
+            handler->PSendSysMessage("{} now has no {} bonus.", target->GetName(), StatBonus::SlotName(*slot));
+        else if (StatBonus::IsRating(*slot) && !StatBonus::IsSkillRating(*slot))
+            handler->PSendSysMessage("{} now has {:+d} {} rating.", target->GetName(), total, StatBonus::SlotName(*slot));
         else
-            handler->PSendSysMessage("{} now has {:+d} {}.", target->GetName(), total, StatBonus::StatName(*stat));
+            handler->PSendSysMessage("{} now has {:+d} {}.", target->GetName(), total, StatBonus::SlotName(*slot));
 
         if (!target->GetConnectedPlayer())
             handler->PSendSysMessage("They are offline; it applies when they next log in.");
+
+        if (!cfg.Enable)
+            handler->PSendSysMessage("StatBonus.Enable is 0, so it is recorded but not in effect.");
 
         return true;
     }
