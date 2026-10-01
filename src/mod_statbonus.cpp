@@ -40,13 +40,27 @@
  * UpdateRating - which is where the equivalent last-moment hook would have to
  * go - would put the number on the sheet and leave the character no faster.
  *
- * That makes ratings applied state, which is exactly what was avoided for the
- * stats, so it is worth saying why it is safe here: nothing resets
- * m_baseRatingValue mid-session. Item mods add and subtract their own deltas
- * rather than rebuilding the array, and there is no rating equivalent of
- * InitStatsForLevel. So the module applies its ratings once at login and
- * reconciles on a change, keeping a record of what it has actually pushed in so
- * a re-grant or a reload moves by the difference rather than stacking.
+ * RESISTANCES, and armor with them, go through Unit::HandleStatFlatModifier on
+ * TOTAL_VALUE, which is again where gear puts them: Player::UpdateResistances
+ * and Player::UpdateArmor both read GetFlatModifierValue(unitMod, TOTAL_VALUE)
+ * as part of their sum. UNIT_MOD_RESISTANCE_START is UNIT_MOD_ARMOR, so all
+ * seven schools are one uniform call, and HandleStatFlatModifier calls
+ * UpdateUnitMod itself, so nothing else has to be poked afterwards.
+ *
+ * Note that its neighbour SetStatFlatModifier carries a comment warning that
+ * use outside an aura handler loses the value when auras change. That warning
+ * is about *setting* the modifier, which overwrites whatever auras had put
+ * there. HandleStatFlatModifier accumulates, exactly as every item does, so a
+ * contribution pushed in this way is not disturbed by auras coming and going.
+ *
+ * Both of those make ratings and resistances applied state, which is exactly
+ * what was avoided for the stats, so it is worth saying why it is safe here:
+ * nothing resets m_baseRatingValue or m_auraFlatModifiersGroup mid-session.
+ * Item mods add and subtract their own deltas rather than rebuilding either,
+ * and there is no equivalent of InitStatsForLevel for them. So the module
+ * applies them once at login and reconciles on a change, keeping a record of
+ * what it has actually pushed in so a re-grant or a reload moves by the
+ * difference rather than stacking.
  */
 
 #include "StatBonusStore.h"
@@ -81,9 +95,10 @@ namespace
     StatBonus::Store store;
 
     // What this module has actually pushed into each online character's
-    // m_baseRatingValue, so a change moves by the difference. Cleared on
-    // logout; the ratings themselves go with the session.
-    std::unordered_map<uint32, std::array<int32, StatBonus::RATING_COUNT>> applied;
+    // m_baseRatingValue and m_auraFlatModifiersGroup, so a change moves by the
+    // difference. Cleared on logout; those contributions go with the session.
+    // Indexed by slot, and only the applied slots are ever used.
+    std::unordered_map<uint32, StatBonus::Bonuses> applied;
 
     void LoadConfig()
     {
@@ -91,11 +106,11 @@ namespace
         cfg.Limit  = sConfigMgr->GetOption<int32>("StatBonus.Limit", 0);
     }
 
-    // Bring a connected character's ratings in line with the store, by the
-    // difference. Also the revert path: with the module disabled, or every
-    // grant cleared, the desired amount is zero and this takes the ratings back
-    // out again.
-    void ReconcileRatings(Player* player)
+    // Bring a connected character's ratings and resistances in line with the
+    // store, by the difference. Also the revert path: with the module disabled,
+    // or every grant cleared, the desired amount is zero and this takes the
+    // contributions back out again.
+    void ReconcileApplied(Player* player)
     {
         if (!player)
             return;
@@ -108,23 +123,35 @@ namespace
         if (!bonuses && it == applied.end())
             return;
 
-        std::array<int32, StatBonus::RATING_COUNT>& have =
-            it != applied.end() ? it->second : applied[guid];
+        StatBonus::Bonuses& have = it != applied.end() ? it->second : applied[guid];
 
         bool anyLeft = false;
 
-        for (std::size_t rating = 0; rating < StatBonus::RATING_COUNT; ++rating)
+        for (std::size_t slot = StatBonus::RATING_FIRST; slot < StatBonus::SLOT_COUNT; ++slot)
         {
-            int32 const want  = bonuses ? (*bonuses)[StatBonus::RatingSlot(rating)] : 0;
-            int32 const delta = want - have[rating];
+            int32 const want  = bonuses ? (*bonuses)[slot] : 0;
+            int32 const delta = want - have[slot];
 
             if (delta)
             {
-                // A signed value with apply=true is how ApplyRatingMod takes a
-                // decrease as well; the haste branch reads the old and new
-                // totals either way round.
-                player->ApplyRatingMod(CombatRating(rating), delta, true);
-                have[rating] = want;
+                if (StatBonus::IsRating(slot))
+                {
+                    // A signed value with apply=true is how ApplyRatingMod
+                    // takes a decrease as well; the haste branch reads the old
+                    // and new totals either way round.
+                    player->ApplyRatingMod(CombatRating(StatBonus::RatingIndex(slot)), delta, true);
+                }
+                else
+                {
+                    // UNIT_MOD_RESISTANCE_START is UNIT_MOD_ARMOR, so school 0
+                    // is armor and needs no special case. This accumulates and
+                    // calls UpdateUnitMod itself.
+                    uint32 const school = StatBonus::ResistanceSchool(slot);
+                    player->HandleStatFlatModifier(UnitMods(UNIT_MOD_RESISTANCE_START + school),
+                        TOTAL_VALUE, float(delta), true);
+                }
+
+                have[slot] = want;
             }
 
             if (want)
@@ -162,7 +189,7 @@ namespace
             auto const slot = StatBonus::SlotOf(kind, id);
             if (!slot)
             {
-                LOG_ERROR("module", "mod-statbonus: character {} has a bonus for kind {} id {}, which is not a stat or a rating; skipped.",
+                LOG_ERROR("module", "mod-statbonus: character {} has a bonus for kind {} id {}, which is not a stat, a rating or a resistance; skipped.",
                     guid, kind, id);
                 ++skipped;
                 continue;
@@ -204,7 +231,7 @@ namespace
         if (!player)
             return;
 
-        ReconcileRatings(player);
+        ReconcileApplied(player);
         player->UpdateAllStats();
     }
 }
@@ -258,11 +285,11 @@ public:
 
     void OnPlayerLogin(Player* player) override
     {
-        // Ratings are applied state and go with the session, so they are put
-        // back on at every login. Stats need nothing here - their hook has
-        // already fired several times by this point.
-        if (store.AnyRatings())
-            ReconcileRatings(player);
+        // Ratings and resistances are applied state and go with the session, so
+        // they are put back on at every login. Stats need nothing here - their
+        // hook has already fired several times by this point.
+        if (store.AnyApplied())
+            ReconcileApplied(player);
     }
 
     void OnPlayerLogout(Player* player) override
@@ -300,8 +327,8 @@ public:
     {
         uint32 const count = LoadBonuses();
 
-        // Ratings are applied state, so a reload has to walk the characters
-        // that are already on and move them to whatever the table now says.
+        // Ratings and resistances are applied state, so a reload has to walk
+        // the characters already on and move them to whatever the table says.
         //
         // ObjectAccessor rather than WorldSessionMgr::GetAllSessions(), which
         // looks like the obvious choice and is wrong on a playerbot realm:
@@ -314,7 +341,7 @@ public:
             if (!player || !player->IsInWorld())
                 continue;
 
-            ReconcileRatings(player);
+            ReconcileApplied(player);
             player->UpdateAllStats();
             ++reconciled;
         }
@@ -326,27 +353,12 @@ public:
 
     static bool HandleStatBonusNamesCommand(ChatHandler* handler)
     {
-        handler->PSendSysMessage("Primary stats:");
-        std::string line;
-        for (std::size_t slot = 0; slot < StatBonus::STAT_COUNT; ++slot)
-            line += Acore::StringFormat("{}{}", line.empty() ? "  " : ", ", StatBonus::SlotName(slot));
-        handler->PSendSysMessage("{}", line);
+        PrintNames(handler, "Primary stats:", 0, StatBonus::RATING_FIRST);
+        PrintNames(handler, "Combat ratings:", StatBonus::RATING_FIRST, StatBonus::RESISTANCE_FIRST);
+        PrintNames(handler, "Resistances:", StatBonus::RESISTANCE_FIRST, StatBonus::SLOT_COUNT);
 
-        handler->PSendSysMessage("Combat ratings:");
-        line.clear();
-        for (std::size_t slot = StatBonus::STAT_COUNT; slot < StatBonus::SLOT_COUNT; ++slot)
-        {
-            line += Acore::StringFormat("{}{}", line.empty() ? "  " : ", ", StatBonus::SlotName(slot));
-            if (line.size() > 150)
-            {
-                handler->PSendSysMessage("{}", line);
-                line.clear();
-            }
-        }
-        if (!line.empty())
-            handler->PSendSysMessage("{}", line);
-
-        handler->PSendSysMessage("Also str/agi/sta/int/spi, melee_hit, spell_crit, arp and similar, or stat:<n> / rating:<n> by enum index.");
+        handler->PSendSysMessage("Also str/agi/sta/int/spi, melee_hit, spell_crit, arp, bare school names like fire,");
+        handler->PSendSysMessage("or stat:<n> / rating:<n> / resist:<n> by enum index.");
         return true;
     }
 
@@ -430,6 +442,27 @@ public:
     }
 
 private:
+    // Wrapped by hand because a chat line is not wide enough for the
+    // twenty-five rating names on one row.
+    static void PrintNames(ChatHandler* handler, char const* heading, std::size_t first, std::size_t last)
+    {
+        handler->PSendSysMessage("{}", heading);
+
+        std::string line;
+        for (std::size_t slot = first; slot < last; ++slot)
+        {
+            line += Acore::StringFormat("{}{}", line.empty() ? "  " : ", ", StatBonus::SlotName(slot));
+            if (line.size() > 140)
+            {
+                handler->PSendSysMessage("{}", line);
+                line.clear();
+            }
+        }
+
+        if (!line.empty())
+            handler->PSendSysMessage("{}", line);
+    }
+
     static std::string Describe(StatBonus::Bonuses const& bonuses)
     {
         std::string out;
@@ -442,7 +475,7 @@ private:
 
     static bool Unknown(ChatHandler* handler, std::string const& what)
     {
-        handler->PSendSysMessage("Unknown stat or rating \"{}\". \".statbonus names\" lists them.", what);
+        handler->PSendSysMessage("Unknown stat, rating or resistance \"{}\". \".statbonus names\" lists them.", what);
         handler->SetSentErrorMessage(true);
         return false;
     }

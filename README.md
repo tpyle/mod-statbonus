@@ -1,8 +1,13 @@
 # mod-statbonus
 
-Permanent flat additions to a character's five primary stats and its twenty-five
-combat ratings: strength through spirit, and hit, expertise, dodge, parry,
-block, crit, haste, defense, armor penetration and the rest.
+Permanent flat additions to a character's five primary stats, its twenty-five
+combat ratings and its seven resistance schools: strength through spirit; hit,
+expertise, dodge, parry, block, crit, haste, defense, armor penetration and the
+rest; and armor, fire, frost, nature, shadow, arcane and holy resistance.
+
+Each of the three reaches the character by a different road, because the server
+holds them differently, and only the first of them needed a change to the
+core.
 
 ## Why the stats need a core hook
 
@@ -47,7 +52,7 @@ it.
 
 ## Why the ratings do not
 
-The ratings take the other road: `Player::ApplyRatingMod`, which is where gear
+The ratings take another road: `Player::ApplyRatingMod`, which is where gear
 puts them, rather than a second hook of the same shape.
 
 The reason is haste. A last-moment hook for ratings would have to go inside
@@ -74,15 +79,35 @@ item would, including the derived percentages: `UpdateRating` calls
 `UpdateDodgePercentage`, `UpdateParryPercentage`, `UpdateExpertise`,
 `UpdateArmorPenetration` and the hit and crit updates itself.
 
+## And the resistances neither
+
+Resistances - and armor with them - go through
+`Unit::HandleStatFlatModifier(unitMod, TOTAL_VALUE, amount, apply)`, which is
+once again where gear puts them: `Player::UpdateResistances` and
+`Player::UpdateArmor` both read `GetFlatModifierValue(unitMod, TOTAL_VALUE)` as
+part of their sum. `UNIT_MOD_RESISTANCE_START` *is* `UNIT_MOD_ARMOR`, so all
+seven schools are one uniform call with no special case for armor, and
+`HandleStatFlatModifier` calls `UpdateUnitMod` itself, so nothing else has to be
+poked afterwards.
+
+Its neighbour `SetStatFlatModifier` carries a comment in the core warning that
+"usage outside of AuraEffect Handlers is discouraged as the value will be lost
+when auras change". That warning is about *setting* the modifier, which
+overwrites whatever auras had put there. `HandleStatFlatModifier` accumulates,
+exactly as every item does, so a contribution pushed in this way is not
+disturbed by auras coming and going - and it is why the same reasoning that
+makes the ratings safe covers these too.
+
 ## The table
 
 `character_stat_bonus` in the characters database, one row per character per
-bonus: `Guid`, `Kind` (0 primary stat, 1 combat rating), `Id` (an index into
-whichever enum `Kind` names), `Amount` (may be negative), and a `Comment` for
-the GM. The two enums are kept as the core's own rather than flattened into one
-numbering, so the rows stay readable against `Stats` and `CombatRating` if the
-size of either ever changes. A bonus of zero is deleted rather than stored, so
-the table is a list of what has actually been granted.
+bonus: `Guid`, `Kind` (0 primary stat, 1 combat rating, 2 resistance), `Id` (an
+index into whichever enum `Kind` names), `Amount` (may be negative), and a
+`Comment` for the GM. The three enums are kept as the core's own rather than
+flattened into one numbering, so the rows stay readable against `Stats`,
+`CombatRating` and `SpellSchools` if the size of any of them ever changes. A
+bonus of zero is deleted rather than stored, so the table is a list of what has
+actually been granted.
 
 It ships with the module as `data/sql/db-characters/base/`, and the core's
 database updater applies it at startup:
@@ -94,7 +119,7 @@ grant on the realm the next time somebody fixed a typo in its comments.
 
 Bonuses are read into memory at startup and kept there, so the stat hook costs
 one hash lookup; when nothing is granted it costs one branch, and when only
-primary stats are granted the per-login rating pass is skipped entirely.
+primary stats are granted the per-login reconciliation is skipped entirely.
 
 ## Commands
 
@@ -116,8 +141,22 @@ primary stats are granted the per-login rating pass is skipped entirely.
   that is what the character sheet calls them. Aliases like `melee_hit`,
   `spell_crit` and `arp` work, and a hyphen or a space stands in for the
   underscore.
-* **By index** - `stat:<n>` and `rating:<n>` address `Stats` and `CombatRating`
-  directly.
+* **Resistances** - `armor`, `resist_holy`, `resist_fire`, `resist_nature`,
+  `resist_frost`, `resist_shadow`, `resist_arcane`. The bare school name works
+  (`fire`), as do `fire_resistance`, `resistance_fire` and `fire_res`. `armor`
+  is resistance school 0 and is a different thing from `armor_penetration`,
+  which is a rating; the names are matched exactly so the two cannot be
+  confused.
+* **By index** - `stat:<n>`, `rating:<n>` and `resist:<n>` address `Stats`,
+  `CombatRating` and `SpellSchools` directly.
+
+`.statbonus names` prints the whole vocabulary, which is the fastest way to find
+the name for a row you are looking at.
+
+`hit`, `crit` and `haste` on their own are the **melee** ratings. Each of the
+three has its own row per paper doll tab, so the Spells tab reads `hit_spell`
+and `haste_spell` - asking for `haste` and then watching the Spells tab shows
+nothing moving, which is a mistake worth making only once.
 
 A bare number is refused: it would have to mean either a stat or a rating, and
 either reading is wrong half the time. There is also no bare `resilience`,
@@ -131,15 +170,16 @@ bonus goes, because `SetStat` writes an unsigned field, and the core's own
 
 `<player>` may be omitted to use the selected character, and may name an offline
 one - the grant is written and applies at their next login, which the command
-says. After any change the module reconciles that character's ratings and calls
-`UpdateAllStats()`, since neither route fires on its own for someone standing
-still.
+says. After any change the module reconciles that character's ratings and
+resistances and calls `UpdateAllStats()`, since none of the three routes fires
+on its own for someone standing still.
 
 `.statbonus list` with no argument prints the whole realm. That is the useful
 view when a realm has a handful of grants, and it is the one that works from the
 console, where there is no selection to fall back to. `.statbonus reload` walks
-the characters already online and moves their ratings to whatever the table now
-says, because that state is applied rather than recomputed.
+the characters already online and moves their ratings and resistances to
+whatever the table now says, because that state is applied rather than
+recomputed.
 
 ## Configuration (`mod_statbonus.conf`)
 
@@ -147,7 +187,7 @@ says, because that state is applied rather than recomputed.
 quickest way to tell whether something odd on a character comes from this
 module; switching it off also takes the applied ratings back out at the next
 reconciliation. `StatBonus.Limit` is the largest absolute amount the commands
-will write to one stat or rating, symmetric, clamping rather than refusing and
+will write to one stat, rating or resistance, symmetric, clamping rather than refusing and
 reporting the clamp; it guards against a mistyped amount, not against the
 feature - a bonus is flat and stacks with gear without any cap of its own, so a
 stray extra digit is otherwise a character with 3000 strength, or one who never
@@ -159,7 +199,7 @@ so `reload config` applies them live.
 ## Tests
 
 `src/StatBonusStore.h` holds the parts that are just rules - the slot space that
-holds both enums, name parsing, the floor at zero, the limit clamp, and the
+holds all three enums, name parsing, the floor at zero, the limit clamp, and the
 store - and includes nothing but the standard library, so `tests/` builds and
 runs without AzerothCore:
 

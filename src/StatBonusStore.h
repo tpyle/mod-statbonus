@@ -5,11 +5,12 @@
  * and run this without AzerothCore present. The store is keyed on a character's
  * GUID counter rather than an ObjectGuid for the same reason.
  *
- * The two kinds of bonus share one flat slot space - the five primary stats
- * first, then the twenty-five combat ratings - because everything above the
- * point of application treats them alike: one name to parse, one number to
- * store, one row in the table. They part company only where they are handed to
- * the server, and that is the module's business rather than this header's.
+ * The three kinds of bonus share one flat slot space - the five primary stats
+ * first, then the twenty-five combat ratings, then the seven resistance schools
+ * - because everything above the point of application treats them alike: one
+ * name to parse, one number to store, one row in the table. They part company
+ * only where they are handed to the server, and that is the module's business
+ * rather than this header's.
  */
 
 #ifndef MOD_STATBONUS_STORE_H
@@ -29,28 +30,45 @@
 
 namespace StatBonus
 {
-    // Matches the core's MAX_STATS and MAX_COMBAT_RATING. Slots 0-4 are the
-    // Stats enum in its own order, slots 5-29 the CombatRating enum in its own
-    // order, so a slot converts to either by adding or subtracting STAT_COUNT.
-    constexpr std::size_t STAT_COUNT   = 5;
-    constexpr std::size_t RATING_COUNT = 25;
-    constexpr std::size_t SLOT_COUNT   = STAT_COUNT + RATING_COUNT;
+    // Matches the core's MAX_STATS, MAX_COMBAT_RATING and MAX_SPELL_SCHOOL.
+    // Slots 0-4 are the Stats enum in its own order, 5-29 the CombatRating
+    // enum, 30-36 the SpellSchools enum, each in its own order, so a slot
+    // converts to any of them by subtracting where its range starts.
+    constexpr std::size_t STAT_COUNT       = 5;
+    constexpr std::size_t RATING_COUNT     = 25;
+    constexpr std::size_t RESISTANCE_COUNT = 7;
+    constexpr std::size_t SLOT_COUNT       = STAT_COUNT + RATING_COUNT + RESISTANCE_COUNT;
 
     // What the table's Kind column holds. Stored per kind rather than as the
     // flat slot so the rows stay readable against the core's enums if the
-    // number of either ever changes.
+    // number of any of them ever changes.
     enum Kind : std::uint8_t
     {
-        KIND_STAT   = 0,
-        KIND_RATING = 1
+        KIND_STAT       = 0,
+        KIND_RATING     = 1,
+        KIND_RESISTANCE = 2
     };
 
     using Bonuses = std::array<std::int32_t, SLOT_COUNT>;
 
-    inline bool IsRating(std::size_t slot) { return slot >= STAT_COUNT && slot < SLOT_COUNT; }
+    constexpr std::size_t RATING_FIRST     = STAT_COUNT;
+    constexpr std::size_t RESISTANCE_FIRST = STAT_COUNT + RATING_COUNT;
 
-    inline std::size_t RatingSlot(std::size_t rating) { return STAT_COUNT + rating; }
-    inline std::size_t RatingIndex(std::size_t slot)  { return slot - STAT_COUNT; }
+    inline bool IsStat(std::size_t slot)   { return slot < STAT_COUNT; }
+    inline bool IsRating(std::size_t slot) { return slot >= RATING_FIRST && slot < RESISTANCE_FIRST; }
+    inline bool IsResistance(std::size_t slot) { return slot >= RESISTANCE_FIRST && slot < SLOT_COUNT; }
+
+    // True where the bonus is handed to the server by being pushed in and left
+    // there, rather than answered fresh on every recalculation. Those are the
+    // slots the module has to reconcile at login and after a change; the
+    // primary stats need none of that.
+    inline bool IsApplied(std::size_t slot) { return IsRating(slot) || IsResistance(slot); }
+
+    inline std::size_t RatingSlot(std::size_t rating) { return RATING_FIRST + rating; }
+    inline std::size_t RatingIndex(std::size_t slot)  { return slot - RATING_FIRST; }
+
+    inline std::size_t ResistanceSlot(std::size_t school) { return RESISTANCE_FIRST + school; }
+    inline std::size_t ResistanceSchool(std::size_t slot) { return slot - RESISTANCE_FIRST; }
 
     inline std::optional<std::size_t> SlotOf(std::uint8_t kind, std::size_t index)
     {
@@ -60,11 +78,27 @@ namespace StatBonus
         if (kind == KIND_RATING && index < RATING_COUNT)
             return RatingSlot(index);
 
+        if (kind == KIND_RESISTANCE && index < RESISTANCE_COUNT)
+            return ResistanceSlot(index);
+
         return std::nullopt;
     }
 
-    inline std::uint8_t KindOf(std::size_t slot) { return IsRating(slot) ? KIND_RATING : KIND_STAT; }
-    inline std::size_t IndexOf(std::size_t slot) { return IsRating(slot) ? RatingIndex(slot) : slot; }
+    inline std::uint8_t KindOf(std::size_t slot)
+    {
+        if (IsResistance(slot))
+            return KIND_RESISTANCE;
+
+        return IsRating(slot) ? KIND_RATING : KIND_STAT;
+    }
+
+    inline std::size_t IndexOf(std::size_t slot)
+    {
+        if (IsResistance(slot))
+            return ResistanceSchool(slot);
+
+        return IsRating(slot) ? RatingIndex(slot) : slot;
+    }
 
     // The canonical name of every slot, which is also the name the commands
     // print. Each one has to parse back to its own slot; a test holds that.
@@ -104,6 +138,14 @@ namespace StatBonus
             case 28: return "expertise";              // CR_EXPERTISE
             case 29: return "armor_penetration";      // CR_ARMOR_PENETRATION
 
+            case 30: return "armor";                  // SPELL_SCHOOL_NORMAL
+            case 31: return "resist_holy";            // SPELL_SCHOOL_HOLY
+            case 32: return "resist_fire";            // SPELL_SCHOOL_FIRE
+            case 33: return "resist_nature";          // SPELL_SCHOOL_NATURE
+            case 34: return "resist_frost";           // SPELL_SCHOOL_FROST
+            case 35: return "resist_shadow";          // SPELL_SCHOOL_SHADOW
+            case 36: return "resist_arcane";          // SPELL_SCHOOL_ARCANE
+
             default: return "unknown";
         }
     }
@@ -113,15 +155,18 @@ namespace StatBonus
     // Only used to word the command's confirmation.
     inline bool IsSkillRating(std::size_t slot)
     {
-        return slot == 5 || slot == 6 || (slot >= 25 && slot <= 27);
+        return slot == RatingSlot(0)                       // CR_WEAPON_SKILL
+            || slot == RatingSlot(1)                       // CR_DEFENSE_SKILL
+            || (slot >= RatingSlot(20) && slot <= RatingSlot(22));  // the three weapon skills
     }
 
     // Accepts the canonical name above, the abbreviations the character sheet
-    // itself uses, the melee aliases spelled out, and an explicit "stat:<n>" or
-    // "rating:<n>" for addressing the core's enums by index. A bare number is
-    // deliberately NOT accepted: it would have to mean a stat or a rating, and
-    // a bonus landing on the wrong one of those is invisible until the sheet
-    // looks wrong, which is a long way from the cause.
+    // itself uses, the melee aliases spelled out, the bare school name for a
+    // resistance, and an explicit "stat:<n>", "rating:<n>" or "resist:<n>" for
+    // addressing the core's enums by index. A bare number is deliberately NOT
+    // accepted: it would have to mean one of the three, and a bonus landing on
+    // the wrong one is invisible until the sheet looks wrong, which is a long
+    // way from the cause.
     inline std::optional<std::size_t> ParseSlot(std::string_view name)
     {
         // Trim the edges, then treat a hyphen or an interior space as the
@@ -159,6 +204,8 @@ namespace StatBonus
                 return SlotOf(KIND_STAT, index);
             if (kind == "rating" || kind == "cr")
                 return SlotOf(KIND_RATING, index);
+            if (kind == "resistance" || kind == "resist" || kind == "school")
+                return SlotOf(KIND_RESISTANCE, index);
 
             return std::nullopt;
         }
@@ -170,8 +217,8 @@ namespace StatBonus
         if (key == "intellect" || key == "int") return 3;
         if (key == "spirit"    || key == "spi") return 4;
 
-        // Canonical rating names.
-        for (std::size_t slot = STAT_COUNT; slot < SLOT_COUNT; ++slot)
+        // Canonical rating and resistance names.
+        for (std::size_t slot = RATING_FIRST; slot < SLOT_COUNT; ++slot)
             if (key == SlotName(slot))
                 return slot;
 
@@ -195,7 +242,18 @@ namespace StatBonus
         if (key == "haste_melee"   || key == "melee_haste")   return 22;
         if (key == "ranged_haste")                            return 23;
         if (key == "spell_haste")                             return 24;
+        // Exact "armor" is the resistance school, so these have to be their
+        // own spellings and not a prefix match on it.
         if (key == "armorpen" || key == "arp" || key == "armor_pen") return 29;
+
+        // Resistances. The school on its own is what people say - "give me
+        // fire resistance" - and both word orders get typed.
+        if (key == "holy"   || key == "holy_resistance"   || key == "holy_res"   || key == "resistance_holy")   return 31;
+        if (key == "fire"   || key == "fire_resistance"   || key == "fire_res"   || key == "resistance_fire")   return 32;
+        if (key == "nature" || key == "nature_resistance" || key == "nature_res" || key == "resistance_nature") return 33;
+        if (key == "frost"  || key == "frost_resistance"  || key == "frost_res"  || key == "resistance_frost")  return 34;
+        if (key == "shadow" || key == "shadow_resistance" || key == "shadow_res" || key == "resistance_shadow") return 35;
+        if (key == "arcane" || key == "arcane_resistance" || key == "arcane_res" || key == "resistance_arcane") return 36;
 
         return std::nullopt;
     }
@@ -203,7 +261,8 @@ namespace StatBonus
     // A bonus may be negative - taking a point away is as reasonable a use as
     // granting one - but the stat the client is shown must not go below zero,
     // and the field itself is unsigned. Ratings are clamped by the core's own
-    // UpdateRating, so this is only used for the five primary stats.
+    // UpdateRating, and resistances go through the same accumulator gear uses,
+    // so this is only used for the five primary stats.
     inline float Apply(float value, std::int32_t bonus)
     {
         return std::max(0.0f, value + static_cast<float>(bonus));
@@ -292,13 +351,13 @@ namespace StatBonus
         bool Empty() const { return _bonuses.empty(); }
         std::size_t Size() const { return _bonuses.size(); }
 
-        // True when no character has a rating bonus, which lets the module skip
-        // the per-login reconciliation entirely on a realm that only grants
-        // primary stats.
-        bool AnyRatings() const
+        // True when some character has a bonus that has to be pushed in rather
+        // than answered on demand, which lets the module skip the per-login
+        // reconciliation entirely on a realm that only grants primary stats.
+        bool AnyApplied() const
         {
             for (auto const& [guid, bonuses] : _bonuses)
-                for (std::size_t slot = STAT_COUNT; slot < SLOT_COUNT; ++slot)
+                for (std::size_t slot = RATING_FIRST; slot < SLOT_COUNT; ++slot)
                     if (bonuses[slot])
                         return true;
 

@@ -1,5 +1,6 @@
 -- ---------------------------------------------------------------------------
--- mod-statbonus: permanent flat additions to a character's stats and ratings
+-- mod-statbonus: permanent flat additions to a character's stats, ratings and
+-- resistances
 --
 -- The core's database updater applies this at startup because it belongs to an
 -- enabled module: UpdateFetcher::ReceiveIncludedDirectories walks
@@ -13,10 +14,11 @@
 -- One row per character per bonus. A row is deleted rather than stored as zero,
 -- so the table is a list of what has actually been granted.
 --
--- Kind 0 is the Stats enum, kind 1 the CombatRating enum, and Id is an index
--- into whichever of those Kind names. They are held as the core's own two
--- enums rather than flattened into one numbering so the rows stay readable
--- against the core if the size of either ever changes:
+-- Kind 0 is the Stats enum, kind 1 the CombatRating enum, kind 2 the
+-- SpellSchools enum, and Id is an index into whichever of those Kind names.
+-- They are held as the core's own three enums rather than flattened into one
+-- numbering so the rows stay readable against the core if the size of any of
+-- them ever changes:
 --
 --   Kind 0:  0 strength, 1 agility, 2 stamina, 3 intellect, 4 spirit
 --   Kind 1:  0 weapon skill, 1 defense skill, 2 dodge, 3 parry, 4 block,
@@ -26,6 +28,11 @@
 --            16 spell crit taken, 17 haste, 18 ranged haste, 19 spell haste,
 --            20 mainhand weapon skill, 21 offhand weapon skill,
 --            22 ranged weapon skill, 23 expertise, 24 armor penetration
+--   Kind 2:  0 armor, 1 holy, 2 fire, 3 nature, 4 frost, 5 shadow, 6 arcane
+--
+-- Armor is school 0 because that is how the core indexes it - armor and the
+-- six magic resistances share one array, and UNIT_MOD_RESISTANCE_START is
+-- UNIT_MOD_ARMOR.
 --
 -- ".statbonus list" prints these by name; the numbers are here for anyone
 -- reading the table directly.
@@ -33,9 +40,9 @@
 
 CREATE TABLE IF NOT EXISTS `character_stat_bonus` (
   `Guid`    int unsigned     NOT NULL              COMMENT 'characters.guid',
-  `Kind`    tinyint unsigned NOT NULL DEFAULT '0'  COMMENT '0 primary stat (Stats), 1 combat rating (CombatRating)',
+  `Kind`    tinyint unsigned NOT NULL DEFAULT '0'  COMMENT '0 primary stat (Stats), 1 combat rating (CombatRating), 2 resistance (SpellSchools)',
   `Id`      tinyint unsigned NOT NULL              COMMENT 'index into the enum named by Kind',
   `Amount`  int              NOT NULL DEFAULT '0'  COMMENT 'flat addition, may be negative; a shown stat is floored at 0',
   `Comment` varchar(255)     DEFAULT NULL          COMMENT 'why it was granted; for the GM, never shown to the player',
   PRIMARY KEY (`Guid`,`Kind`,`Id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='mod-statbonus: flat stat and combat rating additions';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='mod-statbonus: flat stat, combat rating and resistance additions';

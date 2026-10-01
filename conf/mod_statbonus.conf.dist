@@ -3,16 +3,18 @@
 ########################################
 # mod-statbonus configuration
 #
-# Permanent flat additions to a character's five primary stats and its
-# twenty-five combat ratings, held in `character_stat_bonus` in the characters
-# database.
+# Permanent flat additions to a character's five primary stats, its twenty-five
+# combat ratings and its seven resistance schools, held in
+# `character_stat_bonus` in the characters database.
 #
 # A stat bonus presents as base stat: white text on the character sheet, no buff
 # icon, and everything derived from the stat (health from stamina, spell power
 # from intellect) follows. A rating bonus goes in where gear puts its ratings,
 # so hit, expertise, dodge, parry, crit, haste and the rest are
 # indistinguishable from the same amount off an item - including haste actually
-# making the character swing and cast faster.
+# making the character swing and cast faster. Resistances, and armor with them,
+# go into the same accumulator gear feeds, so they read as part of the total the
+# character sheet shows.
 #
 #   .statbonus add <player> <what> <amount>     add to what they already have
 #   .statbonus set <player> <what> <amount>     set the total outright
@@ -21,13 +23,20 @@
 #   .statbonus names                            everything <what> accepts
 #   .statbonus reload                           re-read the table
 #
-# <what> is strength, agility, stamina, intellect or spirit, or a rating:
-# dodge, parry, block, hit, crit, haste, expertise, defense,
-# armor_penetration, the _ranged and _spell forms of hit/crit/haste, the
-# hit_taken and crit_taken ones, and the weapon skills. Abbreviations
-# (str/agi/arp/melee_hit) work, and stat:<n> / rating:<n> address the core's
-# enums by index. A bare number is refused, because it would have to mean
-# either a stat or a rating and either reading is wrong half the time.
+# <what> is strength, agility, stamina, intellect or spirit; a rating - dodge,
+# parry, block, hit, crit, haste, expertise, defense, armor_penetration, the
+# _ranged and _spell forms of hit/crit/haste, the hit_taken and crit_taken
+# ones, and the weapon skills; or a resistance - armor, fire, frost, nature,
+# shadow, arcane, holy. Abbreviations (str/agi/arp/melee_hit/frost_res) work,
+# and stat:<n> / rating:<n> / resist:<n> address the core's enums by index.
+# ".statbonus names" prints the lot. A bare number is refused, because it
+# would have to mean one of the three and any reading is wrong most of the
+# time.
+#
+# Note that "haste", "hit" and "crit" on their own are the MELEE ratings, and
+# each has its own row per tab: the Spells tab reads haste_spell and hit_spell.
+# Note also that armor is resistance school 0 and is not armor_penetration,
+# which is a rating.
 #
 # <amount> may be negative. A shown stat is floored at zero however negative
 # the bonus, because the field itself is unsigned.
@@ -48,7 +57,8 @@ StatBonus.Enable = 1
 #
 #    StatBonus.Limit
 #        Description: Largest absolute bonus the commands will write to one
-#                     stat or rating. A limit of 50 permits -50, and a request
+#                     stat, rating or resistance. A limit of 50 permits -50,
+#                     and a request
 #                     beyond it is clamped rather than refused, with the clamp
 #                     reported back.
 #

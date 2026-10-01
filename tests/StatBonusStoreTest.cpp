@@ -15,19 +15,31 @@
 
 using namespace StatBonus;
 
-TEST(StatBonusSlots, TheSlotSpaceIsTheTwoCoreEnumsBackToBack)
+TEST(StatBonusSlots, TheSlotSpaceIsTheThreeCoreEnumsBackToBack)
 {
     EXPECT_EQ(STAT_COUNT, 5u);                  // MAX_STATS
     EXPECT_EQ(RATING_COUNT, 25u);               // MAX_COMBAT_RATING
-    EXPECT_EQ(SLOT_COUNT, STAT_COUNT + RATING_COUNT);
+    EXPECT_EQ(RESISTANCE_COUNT, 7u);            // MAX_SPELL_SCHOOL
+    EXPECT_EQ(SLOT_COUNT, STAT_COUNT + RATING_COUNT + RESISTANCE_COUNT);
 
-    for (std::size_t slot = 0; slot < STAT_COUNT; ++slot)
-        EXPECT_FALSE(IsRating(slot));
+    // Exactly one predicate is true for every slot, and none past the end.
+    for (std::size_t slot = 0; slot < SLOT_COUNT; ++slot)
+        EXPECT_EQ(int(IsStat(slot)) + int(IsRating(slot)) + int(IsResistance(slot)), 1) << "slot " << slot;
 
-    for (std::size_t slot = STAT_COUNT; slot < SLOT_COUNT; ++slot)
-        EXPECT_TRUE(IsRating(slot));
-
+    EXPECT_FALSE(IsStat(SLOT_COUNT));
     EXPECT_FALSE(IsRating(SLOT_COUNT));
+    EXPECT_FALSE(IsResistance(SLOT_COUNT));
+}
+
+TEST(StatBonusSlots, OnlyRatingsAndResistancesArePushedIn)
+{
+    // IsApplied decides what gets reconciled at login. A primary stat in there
+    // would be added twice: once by the hook and once by the reconciliation.
+    for (std::size_t slot = 0; slot < STAT_COUNT; ++slot)
+        EXPECT_FALSE(IsApplied(slot)) << SlotName(slot);
+
+    for (std::size_t slot = RATING_FIRST; slot < SLOT_COUNT; ++slot)
+        EXPECT_TRUE(IsApplied(slot)) << SlotName(slot);
 }
 
 TEST(StatBonusSlots, SlotAndKindIndexRoundTrip)
@@ -48,7 +60,8 @@ TEST(StatBonusSlots, OutOfRangeKindsAndIndicesHaveNoSlot)
     // hand, so a bad row has to be rejected rather than land somewhere.
     EXPECT_FALSE(SlotOf(KIND_STAT, STAT_COUNT).has_value());
     EXPECT_FALSE(SlotOf(KIND_RATING, RATING_COUNT).has_value());
-    EXPECT_FALSE(SlotOf(2, 0).has_value());
+    EXPECT_FALSE(SlotOf(KIND_RESISTANCE, RESISTANCE_COUNT).has_value());
+    EXPECT_FALSE(SlotOf(3, 0).has_value());
     EXPECT_FALSE(SlotOf(KIND_STAT, 200).has_value());
 }
 
@@ -124,6 +137,38 @@ TEST(StatBonusParse, AliasesAndSeparatorsAndBothWordOrders)
     EXPECT_EQ(ParseSlot(" rating:2 "), RatingSlot(2));
 }
 
+TEST(StatBonusParse, ResistancesByBareSchoolAndBothWordOrders)
+{
+    // Checked against SpellSchools, and school 0 is armor: the core indexes
+    // armor as a resistance and UNIT_MOD_RESISTANCE_START is UNIT_MOD_ARMOR.
+    EXPECT_EQ(ParseSlot("armor"),         ResistanceSlot(0));   // SPELL_SCHOOL_NORMAL
+    EXPECT_EQ(ParseSlot("resist_holy"),   ResistanceSlot(1));   // SPELL_SCHOOL_HOLY
+    EXPECT_EQ(ParseSlot("fire"),          ResistanceSlot(2));   // SPELL_SCHOOL_FIRE
+    EXPECT_EQ(ParseSlot("nature"),        ResistanceSlot(3));
+    EXPECT_EQ(ParseSlot("frost"),         ResistanceSlot(4));
+    EXPECT_EQ(ParseSlot("shadow"),        ResistanceSlot(5));
+    EXPECT_EQ(ParseSlot("arcane"),        ResistanceSlot(6));   // SPELL_SCHOOL_ARCANE
+
+    EXPECT_EQ(ParseSlot("fire_resistance"), ParseSlot("resist_fire"));
+    EXPECT_EQ(ParseSlot("resistance_fire"), ParseSlot("resist_fire"));
+    EXPECT_EQ(ParseSlot("frost_res"),       ParseSlot("resist_frost"));
+    EXPECT_EQ(ParseSlot("resist:4"),        ParseSlot("resist_frost"));
+    EXPECT_EQ(ParseSlot("school:0"),        ParseSlot("armor"));
+    EXPECT_FALSE(ParseSlot("resist:7").has_value());
+}
+
+TEST(StatBonusParse, ArmorAndArmorPenetrationDoNotCollide)
+{
+    // One is a resistance school and the other a combat rating. A prefix match
+    // on "armor" would have quietly sent armor penetration to the wrong place.
+    EXPECT_EQ(ParseSlot("armor"), ResistanceSlot(0));
+    EXPECT_EQ(ParseSlot("armor_penetration"), RatingSlot(24));
+    EXPECT_EQ(ParseSlot("armor_pen"), RatingSlot(24));
+    EXPECT_EQ(ParseSlot("armorpen"), RatingSlot(24));
+    EXPECT_EQ(ParseSlot("arp"), RatingSlot(24));
+    EXPECT_NE(ParseSlot("armor"), ParseSlot("armor_pen"));
+}
+
 TEST(StatBonusParse, NoBareResilienceBecauseItWouldPromiseAllThree)
 {
     // The resilience item stat feeds CR_CRIT_TAKEN_MELEE, _RANGED and _SPELL at
@@ -164,7 +209,6 @@ TEST(StatBonusParse, RejectsAnythingElse)
     EXPECT_FALSE(ParseSlot("").has_value());
     EXPECT_FALSE(ParseSlot("s").has_value());          // strength, stamina or spirit
     EXPECT_FALSE(ParseSlot("st").has_value());         // strength or stamina
-    EXPECT_FALSE(ParseSlot("armor").has_value());      // not a rating; a real thing to ask for and not this
     EXPECT_FALSE(ParseSlot("spellpower").has_value());
     EXPECT_FALSE(ParseSlot("mp5").has_value());
     EXPECT_FALSE(ParseSlot("_").has_value());
@@ -205,40 +249,49 @@ TEST(StatBonusStore, StartsEmptyAndReportsUnknownCharactersAsZero)
     Store store;
 
     EXPECT_TRUE(store.Empty());
-    EXPECT_FALSE(store.AnyRatings());
+    EXPECT_FALSE(store.AnyApplied());
     EXPECT_EQ(store.Size(), 0u);
     EXPECT_EQ(store.Get(42, 0), 0);
     EXPECT_EQ(store.Find(42), nullptr);
 }
 
-TEST(StatBonusStore, StatsAndRatingsAreIndependent)
+TEST(StatBonusStore, TheThreeKindsAreIndependent)
 {
     Store store;
 
     store.Set(1, *ParseSlot("strength"), 5);
     store.Set(1, *ParseSlot("hit"), 20);
+    store.Set(1, *ParseSlot("resist_fire"), 30);
 
     EXPECT_EQ(store.Get(1, *ParseSlot("strength")), 5);
     EXPECT_EQ(store.Get(1, *ParseSlot("hit")), 20);
+    EXPECT_EQ(store.Get(1, *ParseSlot("resist_fire")), 30);
     EXPECT_EQ(store.Get(1, *ParseSlot("hit_spell")), 0);
+    EXPECT_EQ(store.Get(1, *ParseSlot("resist_frost")), 0);
+    EXPECT_EQ(store.Get(1, *ParseSlot("armor")), 0);
     EXPECT_EQ(store.Size(), 1u);
 }
 
-TEST(StatBonusStore, AnyRatingsIsFalseWhileOnlyStatsAreGranted)
+TEST(StatBonusStore, AnyAppliedIsFalseWhileOnlyStatsAreGranted)
 {
     // It gates the per-login reconciliation, so a realm that grants nothing but
-    // primary stats must not pay for the rating path at every login.
+    // primary stats must not pay for that path at every login.
     Store store;
 
     store.Set(1, *ParseSlot("stamina"), 10);
     EXPECT_FALSE(store.Empty());
-    EXPECT_FALSE(store.AnyRatings());
+    EXPECT_FALSE(store.AnyApplied());
 
     store.Set(2, *ParseSlot("dodge"), 10);
-    EXPECT_TRUE(store.AnyRatings());
+    EXPECT_TRUE(store.AnyApplied());
 
     store.Clear(2);
-    EXPECT_FALSE(store.AnyRatings());
+    EXPECT_FALSE(store.AnyApplied());
+
+    // A resistance counts too, and it is the one that would be missed by a
+    // check written when ratings were the only applied kind.
+    store.Set(3, *ParseSlot("resist_fire"), 10);
+    EXPECT_TRUE(store.AnyApplied());
 }
 
 TEST(StatBonusStore, SetAndGetAreIndependentPerSlotAndPerCharacter)
