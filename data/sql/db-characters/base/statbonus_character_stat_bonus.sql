@@ -29,6 +29,13 @@
 --            20 mainhand weapon skill, 21 offhand weapon skill,
 --            22 ranged weapon skill, 23 expertise, 24 armor penetration
 --   Kind 2:  0 armor, 1 holy, 2 fire, 3 nature, 4 frost, 5 shadow, 6 arcane
+--   Kind 3:  0 walk, 1 run, 2 run back, 3 swim, 4 swim back, 5 turn rate,
+--            6 flight, 7 flight back, 8 pitch rate  (UnitMoveType)
+--
+-- Amount is a flat addition for kinds 0 to 2 and a PERCENTAGE for kind 3,
+-- because a movement speed is a rate where 1.0 is normal - a flat 1 there
+-- would mean double speed. So 25 against kind 3 id 1 is a quarter again on
+-- running.
 --
 -- Armor is school 0 because that is how the core indexes it - armor and the
 -- six magic resistances share one array, and UNIT_MOD_RESISTANCE_START is
@@ -40,9 +47,9 @@
 
 CREATE TABLE IF NOT EXISTS `character_stat_bonus` (
   `Guid`    int unsigned     NOT NULL              COMMENT 'characters.guid',
-  `Kind`    tinyint unsigned NOT NULL DEFAULT '0'  COMMENT '0 primary stat (Stats), 1 combat rating (CombatRating), 2 resistance (SpellSchools)',
+  `Kind`    tinyint unsigned NOT NULL DEFAULT '0'  COMMENT '0 stat (Stats), 1 rating (CombatRating), 2 resistance (SpellSchools), 3 movement (UnitMoveType, Amount is a percentage)',
   `Id`      tinyint unsigned NOT NULL              COMMENT 'index into the enum named by Kind',
-  `Amount`  int              NOT NULL DEFAULT '0'  COMMENT 'flat addition, may be negative; a shown stat is floored at 0',
+  `Amount`  int              NOT NULL DEFAULT '0'  COMMENT 'flat addition for kinds 0-2, percentage for kind 3; may be negative',
   `Comment` varchar(255)     DEFAULT NULL          COMMENT 'why it was granted; for the GM, never shown to the player',
   PRIMARY KEY (`Guid`,`Kind`,`Id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='mod-statbonus: flat stat, combat rating and resistance additions';

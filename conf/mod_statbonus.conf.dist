@@ -23,12 +23,21 @@
 #   .statbonus names                            everything <what> accepts
 #   .statbonus reload                           re-read the table
 #
+# MOVEMENT IS A PERCENTAGE, not a flat addition like everything else here. A
+# speed is a rate where 1.0 is normal, and the yards per second come from the
+# core's table - 7.0 running, 4.722222 swimming - so a flat 1 would mean double
+# speed. The stored integer is read as a percentage instead: 1 is 1%, 25 is a
+# quarter again. It is added to the rate rather than multiplied into it, so the
+# same grant is worth the same whether the character is on foot or mounted.
+#
 # <what> is strength, agility, stamina, intellect or spirit; a rating - dodge,
 # parry, block, hit, crit, haste, expertise, defense, armor_penetration, the
 # _ranged and _spell forms of hit/crit/haste, the hit_taken and crit_taken
 # ones, and the weapon skills; or a resistance - armor, fire, frost, nature,
-# shadow, arcane, holy. Abbreviations (str/agi/arp/melee_hit/frost_res) work,
-# and stat:<n> / rating:<n> / resist:<n> address the core's enums by index.
+# shadow, arcane, holy; or a movement rate - speed (meaning run_speed),
+# swim, fly, and the rest by name. Abbreviations
+# (str/agi/arp/melee_hit/frost_res) work, and stat:<n> / rating:<n> /
+# resist:<n> / movement:<n> address the core's enums by index.
 # ".statbonus names" prints the lot. A bare number is refused, because it
 # would have to mean one of the three and any reading is wrong most of the
 # time.
@@ -75,3 +84,13 @@ StatBonus.Enable = 1
 #        Default:     0 - (No limit)
 
 StatBonus.Limit = 0
+
+#
+#    StatBonus.SpeedLimit
+#        Description: The same, for movement, which has its own ceiling because
+#                     it is the one kind measured in percentage points. A limit
+#                     tuned for combat ratings, where a useful grant is in the
+#                     hundreds, would allow twenty times normal speed.
+#        Default:     0 - (No limit)
+
+StatBonus.SpeedLimit = 0

@@ -37,7 +37,8 @@ namespace StatBonus
     constexpr std::size_t STAT_COUNT       = 5;
     constexpr std::size_t RATING_COUNT     = 25;
     constexpr std::size_t RESISTANCE_COUNT = 7;
-    constexpr std::size_t SLOT_COUNT       = STAT_COUNT + RATING_COUNT + RESISTANCE_COUNT;
+    constexpr std::size_t MOVEMENT_COUNT   = 9;    // MAX_MOVE_TYPE
+    constexpr std::size_t SLOT_COUNT       = STAT_COUNT + RATING_COUNT + RESISTANCE_COUNT + MOVEMENT_COUNT;
 
     // What the table's Kind column holds. Stored per kind rather than as the
     // flat slot so the rows stay readable against the core's enums if the
@@ -46,17 +47,27 @@ namespace StatBonus
     {
         KIND_STAT       = 0,
         KIND_RATING     = 1,
-        KIND_RESISTANCE = 2
+        KIND_RESISTANCE = 2,
+        KIND_MOVEMENT   = 3
     };
 
     using Bonuses = std::array<std::int32_t, SLOT_COUNT>;
 
     constexpr std::size_t RATING_FIRST     = STAT_COUNT;
     constexpr std::size_t RESISTANCE_FIRST = STAT_COUNT + RATING_COUNT;
+    constexpr std::size_t MOVEMENT_FIRST   = RESISTANCE_FIRST + RESISTANCE_COUNT;
 
     inline bool IsStat(std::size_t slot)   { return slot < STAT_COUNT; }
     inline bool IsRating(std::size_t slot) { return slot >= RATING_FIRST && slot < RESISTANCE_FIRST; }
-    inline bool IsResistance(std::size_t slot) { return slot >= RESISTANCE_FIRST && slot < SLOT_COUNT; }
+    inline bool IsResistance(std::size_t slot) { return slot >= RESISTANCE_FIRST && slot < MOVEMENT_FIRST; }
+
+    // The one kind whose Amount is not a flat addition.
+    //
+    // A movement speed is a rate, where 1.0 is normal and the yards per second
+    // come from the core's baseMoveSpeed table - 7.0 running, 4.722222
+    // swimming. A flat 1 there would mean double speed, so the stored integer
+    // is read as a percentage instead: 1 is 1%, 25 is a quarter again.
+    inline bool IsMovement(std::size_t slot) { return slot >= MOVEMENT_FIRST && slot < SLOT_COUNT; }
 
     // True where the bonus is handed to the server by being pushed in and left
     // there, rather than answered fresh on every recalculation. Those are the
@@ -70,6 +81,27 @@ namespace StatBonus
     inline std::size_t ResistanceSlot(std::size_t school) { return RESISTANCE_FIRST + school; }
     inline std::size_t ResistanceSchool(std::size_t slot) { return slot - RESISTANCE_FIRST; }
 
+    inline std::size_t MovementSlot(std::size_t moveType) { return MOVEMENT_FIRST + moveType; }
+    inline std::size_t MovementType(std::size_t slot)     { return slot - MOVEMENT_FIRST; }
+
+    // MOVE_TURN_RATE and MOVE_PITCH_RATE are in UnitMoveType but are not
+    // speeds Unit::UpdateSpeed knows what to do with: its switch sends them to
+    // a default that logs "Unsupported move type". Since the hook this module
+    // reads lives inside that function, a bonus on either could never be asked
+    // for - and asking UpdateSpeed for them anyway only produces that error.
+    //
+    // So they keep their slots, because the table stores UnitMoveType ids and
+    // the numbering has to match the core's, but a grant against one is
+    // refused rather than silently doing nothing.
+    inline bool IsAdjustableMovement(std::size_t slot)
+    {
+        if (!IsMovement(slot))
+            return false;
+
+        std::size_t const type = MovementType(slot);
+        return type != 5 && type != 8;      // MOVE_TURN_RATE, MOVE_PITCH_RATE
+    }
+
     inline std::optional<std::size_t> SlotOf(std::uint8_t kind, std::size_t index)
     {
         if (kind == KIND_STAT && index < STAT_COUNT)
@@ -81,11 +113,17 @@ namespace StatBonus
         if (kind == KIND_RESISTANCE && index < RESISTANCE_COUNT)
             return ResistanceSlot(index);
 
+        if (kind == KIND_MOVEMENT && index < MOVEMENT_COUNT)
+            return MovementSlot(index);
+
         return std::nullopt;
     }
 
     inline std::uint8_t KindOf(std::size_t slot)
     {
+        if (IsMovement(slot))
+            return KIND_MOVEMENT;
+
         if (IsResistance(slot))
             return KIND_RESISTANCE;
 
@@ -94,6 +132,9 @@ namespace StatBonus
 
     inline std::size_t IndexOf(std::size_t slot)
     {
+        if (IsMovement(slot))
+            return MovementType(slot);
+
         if (IsResistance(slot))
             return ResistanceSchool(slot);
 
@@ -145,6 +186,16 @@ namespace StatBonus
             case 34: return "resist_frost";           // SPELL_SCHOOL_FROST
             case 35: return "resist_shadow";          // SPELL_SCHOOL_SHADOW
             case 36: return "resist_arcane";          // SPELL_SCHOOL_ARCANE
+
+            case 37: return "walk_speed";             // MOVE_WALK
+            case 38: return "run_speed";              // MOVE_RUN
+            case 39: return "run_back_speed";         // MOVE_RUN_BACK
+            case 40: return "swim_speed";             // MOVE_SWIM
+            case 41: return "swim_back_speed";        // MOVE_SWIM_BACK
+            case 42: return "turn_rate";              // MOVE_TURN_RATE
+            case 43: return "flight_speed";           // MOVE_FLIGHT
+            case 44: return "flight_back_speed";      // MOVE_FLIGHT_BACK
+            case 45: return "pitch_rate";             // MOVE_PITCH_RATE
 
             default: return "unknown";
         }
@@ -206,6 +257,8 @@ namespace StatBonus
                 return SlotOf(KIND_RATING, index);
             if (kind == "resistance" || kind == "resist" || kind == "school")
                 return SlotOf(KIND_RESISTANCE, index);
+            if (kind == "movement" || kind == "move" || kind == "speed")
+                return SlotOf(KIND_MOVEMENT, index);
 
             return std::nullopt;
         }
@@ -217,7 +270,7 @@ namespace StatBonus
         if (key == "intellect" || key == "int") return 3;
         if (key == "spirit"    || key == "spi") return 4;
 
-        // Canonical rating and resistance names.
+        // Canonical rating, resistance and movement names.
         for (std::size_t slot = RATING_FIRST; slot < SLOT_COUNT; ++slot)
             if (key == SlotName(slot))
                 return slot;
@@ -255,6 +308,14 @@ namespace StatBonus
         if (key == "shadow" || key == "shadow_resistance" || key == "shadow_res" || key == "resistance_shadow") return 35;
         if (key == "arcane" || key == "arcane_resistance" || key == "arcane_res" || key == "resistance_arcane") return 36;
 
+        // Movement. "speed" on its own is running, because that is the one
+        // anybody means by it, and the rest are spelled out. Deliberately no
+        // alias for the backwards rates, the turn rate or the pitch rate -
+        // they are reachable as movement:<n> for anyone who truly wants them.
+        if (key == "speed" || key == "run" || key == "movement_speed") return 38;
+        if (key == "swim")  return 40;
+        if (key == "fly" || key == "flying_speed" || key == "flight") return 43;
+
         return std::nullopt;
     }
 
@@ -266,6 +327,26 @@ namespace StatBonus
     inline float Apply(float value, std::int32_t bonus)
     {
         return std::max(0.0f, value + static_cast<float>(bonus));
+    }
+
+    // A movement bonus applied to a rate.
+    //
+    // Added to the rate rather than multiplied into it, so a percentage always
+    // means the same thing: +10 is a tenth of normal speed, whether the
+    // character is on foot at rate 1.0 or on a mount at 2.0. Multiplying would
+    // have made the same grant worth twice as much while mounted, which is not
+    // what a number called "10%" should do.
+    //
+    // Floored well above zero because a rate of zero cannot be walked out of:
+    // the character would be frozen in place with no buff to remove and no way
+    // to reach a GM. A tenth of normal is slow enough to be unmistakable and
+    // still lets them move.
+    inline float MOVEMENT_RATE_FLOOR() { return 0.1f; }
+
+    inline float ApplyMovement(float rate, std::int32_t percent)
+    {
+        float const adjusted = rate + (static_cast<float>(percent) / 100.0f);
+        return adjusted < MOVEMENT_RATE_FLOOR() ? MOVEMENT_RATE_FLOOR() : adjusted;
     }
 
     // limit 0 means no limit. Symmetric, so a limit of 50 permits -50 as well.

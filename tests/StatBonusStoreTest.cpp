@@ -15,31 +15,40 @@
 
 using namespace StatBonus;
 
-TEST(StatBonusSlots, TheSlotSpaceIsTheThreeCoreEnumsBackToBack)
+TEST(StatBonusSlots, TheSlotSpaceIsTheFourCoreEnumsBackToBack)
 {
     EXPECT_EQ(STAT_COUNT, 5u);                  // MAX_STATS
     EXPECT_EQ(RATING_COUNT, 25u);               // MAX_COMBAT_RATING
     EXPECT_EQ(RESISTANCE_COUNT, 7u);            // MAX_SPELL_SCHOOL
-    EXPECT_EQ(SLOT_COUNT, STAT_COUNT + RATING_COUNT + RESISTANCE_COUNT);
+    EXPECT_EQ(MOVEMENT_COUNT, 9u);              // MAX_MOVE_TYPE
+    EXPECT_EQ(SLOT_COUNT, STAT_COUNT + RATING_COUNT + RESISTANCE_COUNT + MOVEMENT_COUNT);
 
     // Exactly one predicate is true for every slot, and none past the end.
     for (std::size_t slot = 0; slot < SLOT_COUNT; ++slot)
-        EXPECT_EQ(int(IsStat(slot)) + int(IsRating(slot)) + int(IsResistance(slot)), 1) << "slot " << slot;
+        EXPECT_EQ(int(IsStat(slot)) + int(IsRating(slot)) + int(IsResistance(slot)) + int(IsMovement(slot)), 1)
+            << "slot " << slot;
 
     EXPECT_FALSE(IsStat(SLOT_COUNT));
     EXPECT_FALSE(IsRating(SLOT_COUNT));
     EXPECT_FALSE(IsResistance(SLOT_COUNT));
+    EXPECT_FALSE(IsMovement(SLOT_COUNT));
 }
 
 TEST(StatBonusSlots, OnlyRatingsAndResistancesArePushedIn)
 {
-    // IsApplied decides what gets reconciled at login. A primary stat in there
-    // would be added twice: once by the hook and once by the reconciliation.
+    // IsApplied decides what gets reconciled at login. Anything answered by a
+    // hook instead must stay out of it, or it is counted twice: once by the
+    // hook and once by the reconciliation. That is the stats, and now the
+    // movement rates as well, which is why this stops at MOVEMENT_FIRST
+    // rather than running to the end of the slot space.
     for (std::size_t slot = 0; slot < STAT_COUNT; ++slot)
         EXPECT_FALSE(IsApplied(slot)) << SlotName(slot);
 
-    for (std::size_t slot = RATING_FIRST; slot < SLOT_COUNT; ++slot)
+    for (std::size_t slot = RATING_FIRST; slot < MOVEMENT_FIRST; ++slot)
         EXPECT_TRUE(IsApplied(slot)) << SlotName(slot);
+
+    for (std::size_t slot = MOVEMENT_FIRST; slot < SLOT_COUNT; ++slot)
+        EXPECT_FALSE(IsApplied(slot)) << SlotName(slot);
 }
 
 TEST(StatBonusSlots, SlotAndKindIndexRoundTrip)
@@ -61,7 +70,8 @@ TEST(StatBonusSlots, OutOfRangeKindsAndIndicesHaveNoSlot)
     EXPECT_FALSE(SlotOf(KIND_STAT, STAT_COUNT).has_value());
     EXPECT_FALSE(SlotOf(KIND_RATING, RATING_COUNT).has_value());
     EXPECT_FALSE(SlotOf(KIND_RESISTANCE, RESISTANCE_COUNT).has_value());
-    EXPECT_FALSE(SlotOf(3, 0).has_value());
+    EXPECT_FALSE(SlotOf(KIND_MOVEMENT, MOVEMENT_COUNT).has_value());
+    EXPECT_FALSE(SlotOf(4, 0).has_value());
     EXPECT_FALSE(SlotOf(KIND_STAT, 200).has_value());
 }
 
@@ -398,4 +408,156 @@ TEST(StatBonusStore, AllIsOrderedByGuid)
     EXPECT_EQ(all[0].first, 10u);
     EXPECT_EQ(all[1].first, 20u);
     EXPECT_EQ(all[2].first, 30u);
+}
+
+// ---------------------------------------------------------------------------
+// Movement.
+//
+// The one kind whose Amount is not a flat addition. A speed is a rate where
+// 1.0 is normal and the yards per second come from the core's table, so a flat
+// 1 would mean double speed - the integer is a percentage instead.
+// ---------------------------------------------------------------------------
+
+TEST(StatBonusMovement, TheSlotSpaceGainedAFourthKind)
+{
+    EXPECT_EQ(MOVEMENT_COUNT, 9u);          // MAX_MOVE_TYPE
+    EXPECT_EQ(SLOT_COUNT, STAT_COUNT + RATING_COUNT + RESISTANCE_COUNT + MOVEMENT_COUNT);
+
+    // Still exactly one predicate per slot, with the new one included.
+    for (std::size_t slot = 0; slot < SLOT_COUNT; ++slot)
+        EXPECT_EQ(int(IsStat(slot)) + int(IsRating(slot)) + int(IsResistance(slot)) + int(IsMovement(slot)), 1)
+            << "slot " << slot;
+
+    EXPECT_FALSE(IsMovement(SLOT_COUNT));
+}
+
+TEST(StatBonusMovement, MovementIsNotAppliedState)
+{
+    // This is the trap. Ratings and resistances are pushed into the character
+    // and reconciled; movement is answered on demand by the hook, exactly like
+    // a primary stat. Listing it as applied would have it counted twice.
+    for (std::size_t slot = MOVEMENT_FIRST; slot < SLOT_COUNT; ++slot)
+        EXPECT_FALSE(IsApplied(slot)) << SlotName(slot);
+}
+
+TEST(StatBonusMovement, NamesLandOnTheRightUnitMoveType)
+{
+    // Checked against UnitMoveType in UnitDefines.h.
+    EXPECT_EQ(ParseSlot("walk_speed"),   MovementSlot(0));
+    EXPECT_EQ(ParseSlot("run_speed"),    MovementSlot(1));
+    EXPECT_EQ(ParseSlot("swim_speed"),   MovementSlot(3));
+    EXPECT_EQ(ParseSlot("flight_speed"), MovementSlot(6));
+    EXPECT_EQ(ParseSlot("pitch_rate"),   MovementSlot(8));
+
+    // The short forms people actually type.
+    EXPECT_EQ(ParseSlot("speed"), ParseSlot("run_speed"));
+    EXPECT_EQ(ParseSlot("run"),   ParseSlot("run_speed"));
+    EXPECT_EQ(ParseSlot("swim"),  ParseSlot("swim_speed"));
+    EXPECT_EQ(ParseSlot("fly"),   ParseSlot("flight_speed"));
+
+    EXPECT_EQ(ParseSlot("movement:1"), MovementSlot(1));
+    EXPECT_EQ(ParseSlot("move:3"), MovementSlot(3));
+    EXPECT_EQ(ParseSlot("speed:6"), MovementSlot(6));
+    EXPECT_FALSE(ParseSlot("movement:9").has_value());
+}
+
+TEST(StatBonusMovement, SpeedDoesNotCollideWithAnythingElse)
+{
+    // "speed" is a bare name AND a namespace prefix, and the two must not
+    // tread on each other.
+    EXPECT_EQ(ParseSlot("speed"), MovementSlot(1));
+    EXPECT_EQ(ParseSlot("speed:0"), MovementSlot(0));
+
+    // Nor should it be confused with the ratings that sound like it.
+    EXPECT_NE(ParseSlot("speed"), ParseSlot("haste"));
+}
+
+TEST(StatBonusMovement, APercentageIsAddedToTheRate)
+{
+    // On foot, rate 1.0: +10 is a tenth faster.
+    EXPECT_FLOAT_EQ(ApplyMovement(1.0f, 10), 1.10f);
+    EXPECT_FLOAT_EQ(ApplyMovement(1.0f, 100), 2.00f);
+    EXPECT_FLOAT_EQ(ApplyMovement(1.0f, 1), 1.01f);
+    EXPECT_FLOAT_EQ(ApplyMovement(1.0f, 0), 1.0f);
+}
+
+TEST(StatBonusMovement, TheSameGrantIsWorthTheSameMountedOrNot)
+{
+    // Added to the rate rather than multiplied into it. On a mount at 2.0 a
+    // +10 grant is still a tenth of normal speed and not a tenth of the
+    // mount's, which is what "10%" ought to mean.
+    EXPECT_FLOAT_EQ(ApplyMovement(2.0f, 10), 2.10f);
+
+    // NEAR and not FLOAT_EQ: these are differences taken at different
+    // magnitudes, so the float error does not cancel - 0.10000002 against
+    // 0.099999905. The gain is equal to well inside anything that matters at a
+    // hundredth of a rate.
+    EXPECT_NEAR(ApplyMovement(1.0f, 10) - 1.0f, ApplyMovement(2.0f, 10) - 2.0f, 0.0001f);
+}
+
+TEST(StatBonusMovement, NegativeSlowsButNeverFreezes)
+{
+    EXPECT_FLOAT_EQ(ApplyMovement(1.0f, -50), 0.50f);
+
+    // A rate of zero cannot be walked out of - no buff to remove and no way to
+    // reach anybody - so it floors well above it.
+    EXPECT_FLOAT_EQ(ApplyMovement(1.0f, -100), MOVEMENT_RATE_FLOOR());
+    EXPECT_FLOAT_EQ(ApplyMovement(1.0f, -500), MOVEMENT_RATE_FLOOR());
+    EXPECT_GT(ApplyMovement(1.0f, -10000), 0.0f);
+}
+
+TEST(StatBonusMovement, KindAndIndexRoundTripForMovementToo)
+{
+    for (std::size_t slot = MOVEMENT_FIRST; slot < SLOT_COUNT; ++slot)
+    {
+        EXPECT_EQ(KindOf(slot), KIND_MOVEMENT);
+        auto const back = SlotOf(KindOf(slot), IndexOf(slot));
+        ASSERT_TRUE(back.has_value()) << "slot " << slot;
+        EXPECT_EQ(*back, slot);
+    }
+
+    EXPECT_FALSE(SlotOf(KIND_MOVEMENT, MOVEMENT_COUNT).has_value());
+    EXPECT_FALSE(SlotOf(4, 0).has_value());
+}
+
+TEST(StatBonusMovement, TurnRateAndPitchRateAreNotAdjustable)
+{
+    // They are in UnitMoveType but Unit::UpdateSpeed's switch sends them to a
+    // default that logs "Unsupported move type". The hook this module reads
+    // lives inside that function, so a bonus on either could never be asked
+    // for - and asking UpdateSpeed for them anyway logged an error apiece on
+    // every grant, which is how this was found.
+    EXPECT_FALSE(IsAdjustableMovement(MovementSlot(5)));   // MOVE_TURN_RATE
+    EXPECT_FALSE(IsAdjustableMovement(MovementSlot(8)));   // MOVE_PITCH_RATE
+
+    // Everything else is a real speed.
+    for (std::size_t type : { 0u, 1u, 2u, 3u, 4u, 6u, 7u })
+        EXPECT_TRUE(IsAdjustableMovement(MovementSlot(type))) << SlotName(MovementSlot(type));
+}
+
+TEST(StatBonusMovement, OnlyMovementSlotsAreAdjustableMovement)
+{
+    // The predicate has to be false for the other three kinds rather than
+    // reading their slot as a move type.
+    for (std::size_t slot = 0; slot < MOVEMENT_FIRST; ++slot)
+        EXPECT_FALSE(IsAdjustableMovement(slot)) << SlotName(slot);
+
+    EXPECT_FALSE(IsAdjustableMovement(SLOT_COUNT));
+}
+
+TEST(StatBonusMovement, TheyKeepTheirSlotsSoTheEnumStillRoundTrips)
+{
+    // Refused on grant, but not removed: the table stores UnitMoveType ids, so
+    // the numbering has to keep matching the core's.
+    EXPECT_EQ(ParseSlot("turn_rate"), MovementSlot(5));
+    EXPECT_EQ(ParseSlot("pitch_rate"), MovementSlot(8));
+    EXPECT_EQ(ParseSlot("movement:5"), MovementSlot(5));
+
+    for (std::size_t type : { 5u, 8u })
+    {
+        std::size_t const slot = MovementSlot(type);
+        EXPECT_EQ(KindOf(slot), KIND_MOVEMENT);
+        EXPECT_EQ(IndexOf(slot), type);
+        EXPECT_EQ(SlotOf(KIND_MOVEMENT, type), slot);
+    }
 }

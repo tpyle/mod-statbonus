@@ -98,14 +98,54 @@ exactly as every item does, so a contribution pushed in this way is not
 disturbed by auras coming and going - and it is why the same reasoning that
 makes the ratings safe covers these too.
 
+## And movement is a percentage
+
+Movement is the one kind here that is not a flat addition, and the reason is
+arithmetic rather than taste. A speed is a *rate*: 1.0 is normal, and the yards
+per second come from the core's `baseMoveSpeed` table - 7.0 running, 4.722222
+swimming, and a mount is a rate of about 2.0 in the same number. A flat 1 there
+would mean double speed. So the stored integer is read as a percentage: 1 is
+1%, 25 is a quarter again.
+
+It is **added to the rate** rather than multiplied into it, which is what makes
+a grant mean the same thing everywhere. On foot at rate 1.0, +10 gives 1.10. On
+a mount at 2.0 it gives 2.10 - still a tenth of normal speed, not a tenth of
+the mount's. Multiplying would have made the same grant worth twice as much
+while mounted, which is not what a number called "10%" should do.
+
+A negative grant slows, and the result is floored at a tenth of normal rather
+than at zero. A rate of zero cannot be walked out of: there is no buff to
+remove and no way to reach anybody, so the character would simply be stuck.
+
+Movement has its own ceiling, `StatBonus.SpeedLimit`, because `StatBonus.Limit`
+is tuned for combat ratings where a useful grant is in the hundreds - the same
+number applied to a percentage would allow twenty times normal speed.
+
+Like the primary stats, and unlike the ratings and resistances, movement is
+*not* applied state. `Player::UpdateSpeed` recomputes the rate from the auras
+whenever any of them changes, mounting included, so there is nowhere a lasting
+adjustment could be written - which is exactly why it needs a hook of its own,
+`PLAYERHOOK_ON_CALCULATE_SPEED` /
+`PlayerScript::OnPlayerCalculateSpeed(Player*, UnitMoveType, float&)`, called
+immediately before `SetSpeed`. Going through `SetSpeed` is also what tells the
+client (`SMSG_FORCE_RUN_SPEED_CHANGE` and its siblings), which is the same path
+every speed aura takes, so movement validation is satisfied.
+
+All nine `UnitMoveType` rates are addressable. `speed`, `run`, `swim` and `fly`
+are the names worth having; the backwards rates, the turn rate and the pitch
+rate have no aliases and are reached as `movement:<n>` by anyone who wants
+them.
+
 ## The table
 
 `character_stat_bonus` in the characters database, one row per character per
-bonus: `Guid`, `Kind` (0 primary stat, 1 combat rating, 2 resistance), `Id` (an
-index into whichever enum `Kind` names), `Amount` (may be negative), and a
-`Comment` for the GM. The three enums are kept as the core's own rather than
-flattened into one numbering, so the rows stay readable against `Stats`,
-`CombatRating` and `SpellSchools` if the size of any of them ever changes. A
+bonus: `Guid`, `Kind` (0 primary stat, 1 combat rating, 2 resistance, 3
+movement), `Id` (an index into whichever enum `Kind` names), `Amount` (a flat
+addition for kinds 0 to 2 and a percentage for kind 3, and may be negative),
+and a `Comment` for the GM. The four enums are kept as the core's own rather
+than flattened into one numbering, so the rows stay readable against `Stats`,
+`CombatRating`, `SpellSchools` and `UnitMoveType` if the size of any of them
+ever changes. A
 bonus of zero is deleted rather than stored, so the table is a list of what has
 actually been granted.
 

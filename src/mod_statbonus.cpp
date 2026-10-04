@@ -87,8 +87,9 @@ namespace
 {
     struct Config
     {
-        bool  Enable = true;
-        int32 Limit  = 0;   // 0 = no limit
+        bool  Enable     = true;
+        int32 Limit      = 0;   // 0 = no limit
+        int32 SpeedLimit = 0;   // 0 = no limit, in percentage points
     };
 
     Config cfg;
@@ -104,6 +105,11 @@ namespace
     {
         cfg.Enable = sConfigMgr->GetOption<bool>("StatBonus.Enable", true);
         cfg.Limit  = sConfigMgr->GetOption<int32>("StatBonus.Limit", 0);
+
+        // Movement has its own ceiling because it is the one kind measured in
+        // percentage points. A limit tuned for combat ratings, where a useful
+        // grant is hundreds, would allow a character twenty times normal speed.
+        cfg.SpeedLimit = sConfigMgr->GetOption<int32>("StatBonus.SpeedLimit", 0);
     }
 
     // Bring a connected character's ratings and resistances in line with the
@@ -233,6 +239,14 @@ namespace
 
         ReconcileApplied(player);
         player->UpdateAllStats();
+
+        // Nothing recalculates a speed on its own for a character standing
+        // still, and the hook only runs when something asks. Skipping the two
+        // that UpdateSpeed rejects, which otherwise logged an error apiece on
+        // every grant.
+        for (std::size_t type = 0; type < StatBonus::MOVEMENT_COUNT; ++type)
+            if (StatBonus::IsAdjustableMovement(StatBonus::MovementSlot(type)))
+                player->UpdateSpeed(UnitMoveType(type), true);
     }
 }
 
@@ -264,6 +278,7 @@ public:
     StatBonus_PlayerScript() : PlayerScript("StatBonus_PlayerScript",
         {
             PLAYERHOOK_ON_CALCULATE_STAT,
+            PLAYERHOOK_ON_CALCULATE_SPEED,
             PLAYERHOOK_ON_LOGIN,
             PLAYERHOOK_ON_LOGOUT
         }) { }
@@ -281,6 +296,22 @@ public:
             return;
 
         value = StatBonus::Apply(value, bonus);
+    }
+
+    void OnPlayerCalculateSpeed(Player* player, UnitMoveType type, float& rate) override
+    {
+        // Same shape as the stat hook, and for the same reason: UpdateSpeed
+        // recomputes the rate from the auras whenever any of them changes -
+        // mounting included - so there is nowhere a lasting adjustment could
+        // be written and this has to answer afresh each time.
+        if (!cfg.Enable || store.Empty() || !player)
+            return;
+
+        int32 const percent = store.Get(player->GetGUID().GetCounter(), StatBonus::MovementSlot(std::size_t(type)));
+        if (!percent)
+            return;
+
+        rate = StatBonus::ApplyMovement(rate, percent);
     }
 
     void OnPlayerLogin(Player* player) override
@@ -355,10 +386,21 @@ public:
     {
         PrintNames(handler, "Primary stats:", 0, StatBonus::RATING_FIRST);
         PrintNames(handler, "Combat ratings:", StatBonus::RATING_FIRST, StatBonus::RESISTANCE_FIRST);
-        PrintNames(handler, "Resistances:", StatBonus::RESISTANCE_FIRST, StatBonus::SLOT_COUNT);
+        PrintNames(handler, "Resistances:", StatBonus::RESISTANCE_FIRST, StatBonus::MOVEMENT_FIRST);
+        // Only the ones that can actually be adjusted; turn rate and pitch
+        // rate have slots for the sake of the enum and are refused on grant.
+        {
+            handler->PSendSysMessage("Movement (an amount here is a PERCENTAGE):");
+            std::string line;
+            for (std::size_t slot = StatBonus::MOVEMENT_FIRST; slot < StatBonus::SLOT_COUNT; ++slot)
+                if (StatBonus::IsAdjustableMovement(slot))
+                    line += Acore::StringFormat("{}{}", line.empty() ? "  " : ", ", StatBonus::SlotName(slot));
+
+            handler->PSendSysMessage("{}", line);
+        }
 
         handler->PSendSysMessage("Also str/agi/sta/int/spi, melee_hit, spell_crit, arp, bare school names like fire,");
-        handler->PSendSysMessage("or stat:<n> / rating:<n> / resist:<n> by enum index.");
+        handler->PSendSysMessage("speed for run_speed, swim, fly, or stat:<n> / rating:<n> / resist:<n> / movement:<n>.");
         return true;
     }
 
@@ -468,7 +510,8 @@ private:
         std::string out;
         for (std::size_t slot = 0; slot < StatBonus::SLOT_COUNT; ++slot)
             if (bonuses[slot])
-                out += Acore::StringFormat("{}{:+d} {}", out.empty() ? "" : ", ", bonuses[slot], StatBonus::SlotName(slot));
+                out += Acore::StringFormat("{}{:+d}{} {}", out.empty() ? "" : ", ", bonuses[slot],
+                    StatBonus::IsMovement(slot) ? "%" : "", StatBonus::SlotName(slot));
 
         return out;
     }
@@ -503,13 +546,25 @@ private:
         if (!slot)
             return Unknown(handler, what);
 
+        if (StatBonus::IsMovement(*slot) && !StatBonus::IsAdjustableMovement(*slot))
+        {
+            handler->PSendSysMessage("{} is in UnitMoveType but is not a speed the core recalculates - "
+                "Unit::UpdateSpeed rejects it, so a bonus there could never take effect.",
+                StatBonus::SlotName(*slot));
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
         uint32 const guid = target->GetGUID().GetCounter();
 
         int32 const wanted = add ? store.Get(guid, *slot) + amount : amount;
-        int32 const total  = StatBonus::ClampToLimit(wanted, cfg.Limit);
+
+        bool  const isSpeed = StatBonus::IsMovement(*slot);
+        int32 const limit   = isSpeed ? cfg.SpeedLimit : cfg.Limit;
+        int32 const total   = StatBonus::ClampToLimit(wanted, limit);
 
         if (total != wanted)
-            handler->PSendSysMessage("Clamped to StatBonus.Limit ({}).", cfg.Limit);
+            handler->PSendSysMessage("Clamped to StatBonus.{} ({}).", isSpeed ? "SpeedLimit" : "Limit", limit);
 
         store.Set(guid, *slot, total);
         Persist(guid, *slot, total);
@@ -517,6 +572,9 @@ private:
 
         if (total == 0)
             handler->PSendSysMessage("{} now has no {} bonus.", target->GetName(), StatBonus::SlotName(*slot));
+        else if (isSpeed)
+            handler->PSendSysMessage("{} now has {:+d}% {} - a rate, so {:+d} is {:+d}% of normal however they are travelling.",
+                target->GetName(), total, StatBonus::SlotName(*slot), total, total);
         else if (StatBonus::IsRating(*slot) && !StatBonus::IsSkillRating(*slot))
             handler->PSendSysMessage("{} now has {:+d} {} rating.", target->GetName(), total, StatBonus::SlotName(*slot));
         else
