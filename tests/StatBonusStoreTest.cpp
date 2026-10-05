@@ -561,3 +561,81 @@ TEST(StatBonusMovement, TheyKeepTheirSlotsSoTheEnumStillRoundTrips)
         EXPECT_EQ(SlotOf(KIND_MOVEMENT, type), slot);
     }
 }
+
+// ---------------------------------------------------------------------------
+// The quest reward pool.
+//
+// One repeatable quest with many possible outcomes, picked by weight, so the
+// set of things it can grant is rows in a table rather than quests in the
+// world. Weight 0 retires a row without deleting it.
+// ---------------------------------------------------------------------------
+
+TEST(StatBonusPool, TotalIsTheSumOfTheWeights)
+{
+    EXPECT_EQ(TotalWeight({}), 0u);
+    EXPECT_EQ(TotalWeight({{0, 1, 5}}), 5u);
+    EXPECT_EQ(TotalWeight({{0, 1, 5}, {1, 1, 3}, {2, 1, 2}}), 10u);
+    EXPECT_EQ(TotalWeight({{0, 1, 0}, {1, 1, 0}}), 0u);
+}
+
+TEST(StatBonusPool, EveryRollLandsInItsOwnBand)
+{
+    std::vector<QuestReward> const pool = {{0, 1, 5}, {1, 1, 3}, {2, 1, 2}};   // total 10
+
+    for (std::uint32_t roll = 0; roll < 5; ++roll)
+        EXPECT_EQ(PickByWeight(pool, roll), 0u) << "roll " << roll;
+    for (std::uint32_t roll = 5; roll < 8; ++roll)
+        EXPECT_EQ(PickByWeight(pool, roll), 1u) << "roll " << roll;
+    for (std::uint32_t roll = 8; roll < 10; ++roll)
+        EXPECT_EQ(PickByWeight(pool, roll), 2u) << "roll " << roll;
+}
+
+TEST(StatBonusPool, EveryEntryIsReachableAndNoneIsSkipped)
+{
+    // The off-by-one that matters: with `roll <= seen` the first row would
+    // take one extra value and the last would be unreachable.
+    std::vector<QuestReward> const pool = {{0, 1, 1}, {1, 1, 1}, {2, 1, 1}};
+
+    std::vector<int> hits(pool.size(), 0);
+    for (std::uint32_t roll = 0; roll < TotalWeight(pool); ++roll)
+    {
+        auto const picked = PickByWeight(pool, roll);
+        ASSERT_TRUE(picked.has_value()) << "roll " << roll;
+        ++hits[*picked];
+    }
+
+    for (std::size_t i = 0; i < hits.size(); ++i)
+        EXPECT_EQ(hits[i], 1) << "entry " << i;
+}
+
+TEST(StatBonusPool, WeightZeroNeverWins)
+{
+    std::vector<QuestReward> const pool = {{0, 1, 0}, {1, 1, 1}, {2, 1, 0}};
+
+    // The only roll there is must land on the one live row.
+    EXPECT_EQ(PickByWeight(pool, 0), 1u);
+}
+
+TEST(StatBonusPool, NoAnswerRatherThanAGuess)
+{
+    // A pool with nothing in it, or nothing live, must come back empty. The
+    // alternative - defaulting to the first row - would make a mistyped set of
+    // weights look like it was working.
+    EXPECT_FALSE(PickByWeight({}, 0).has_value());
+    EXPECT_FALSE(PickByWeight({{0, 1, 0}, {1, 1, 0}}, 0).has_value());
+
+    // And a roll past the end, which the caller should never produce but which
+    // must not fall off the back of the vector either.
+    std::vector<QuestReward> const pool = {{0, 1, 2}};
+    EXPECT_FALSE(PickByWeight(pool, 2).has_value());
+    EXPECT_FALSE(PickByWeight(pool, 99).has_value());
+}
+
+TEST(StatBonusPool, ASinglerowPoolIsDeterministic)
+{
+    // Which is how "pick your stat" would be built on the same machinery:
+    // five quests, one row each.
+    std::vector<QuestReward> const pool = {{*ParseSlot("strength"), 1, 1}};
+    EXPECT_EQ(PickByWeight(pool, 0), 0u);
+    EXPECT_EQ(pool[0].slot, *ParseSlot("strength"));
+}

@@ -69,16 +69,24 @@
 #include "ChatCommand.h"
 #include "Config.h"
 #include "DatabaseEnv.h"
+#include "Group.h"
+#include "Item.h"
+#include "Mail.h"
 #include "Language.h"
 #include "Log.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
+#include "QuestDef.h"
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
 #include "StringFormat.h"
+#include "Tokenize.h"
+#include "StringConvert.h"
 #include "Unit.h"
 
 #include <string>
+#include <unordered_set>
+#include <vector>
 #include <unordered_map>
 
 using namespace Acore::ChatCommands;
@@ -90,16 +98,35 @@ namespace
         bool  Enable     = true;
         int32 Limit      = 0;   // 0 = no limit
         int32 SpeedLimit = 0;   // 0 = no limit, in percentage points
+
+        // Earning them, rather than being given them by a GM.
+        bool        QuestRewards   = true;
+        uint32      BrokerEntry    = 0;    // 0 = summon nobody
+        uint32      BrokerSeconds  = 120;
+        uint32      TokenItem      = 0;    // 0 = hand out nothing
+        uint32      TokenCount     = 1;
+        std::string TokenCreatures;        // comma separated creature entries
     };
 
     Config cfg;
     StatBonus::Store store;
+
+    constexpr char const* MAIL_SUBJECT_TOKEN = "Your share";
+    constexpr char const* MAIL_BODY_TOKEN =
+        "Your bags were full when this was handed out, so it was sent on instead.";
 
     // What this module has actually pushed into each online character's
     // m_baseRatingValue and m_auraFlatModifiersGroup, so a change moves by the
     // difference. Cleared on logout; those contributions go with the session.
     // Indexed by slot, and only the applied slots are ever used.
     std::unordered_map<uint32, StatBonus::Bonuses> applied;
+
+    // questId -> what it can grant. Read at startup and on reload, so the pool
+    // is tuned with an UPDATE and a ".statbonus reload" rather than a build.
+    std::unordered_map<uint32, std::vector<StatBonus::QuestReward>> questRewards;
+
+    // The creatures that hand out a token when they die.
+    std::unordered_set<uint32> tokenCreatures;
 
     void LoadConfig()
     {
@@ -110,6 +137,20 @@ namespace
         // percentage points. A limit tuned for combat ratings, where a useful
         // grant is hundreds, would allow a character twenty times normal speed.
         cfg.SpeedLimit = sConfigMgr->GetOption<int32>("StatBonus.SpeedLimit", 0);
+
+        cfg.QuestRewards  = sConfigMgr->GetOption<bool>("StatBonus.QuestRewards", true);
+        cfg.BrokerEntry   = sConfigMgr->GetOption<uint32>("StatBonus.Broker.Entry", 0);
+        cfg.BrokerSeconds = sConfigMgr->GetOption<uint32>("StatBonus.Broker.DespawnSeconds", 120);
+        cfg.TokenItem     = sConfigMgr->GetOption<uint32>("StatBonus.Token.Item", 0);
+        cfg.TokenCount    = sConfigMgr->GetOption<uint32>("StatBonus.Token.Count", 1);
+        cfg.TokenCreatures = sConfigMgr->GetOption<std::string>("StatBonus.Token.Creatures", "");
+
+        tokenCreatures.clear();
+        for (std::string_view const field : Acore::Tokenize(cfg.TokenCreatures, ',', false))
+            if (Optional<uint32> const entry = Acore::StringTo<uint32>(field))
+                tokenCreatures.insert(*entry);
+            else
+                LOG_ERROR("module", "mod-statbonus: '{}' in StatBonus.Token.Creatures is not a creature entry", field);
     }
 
     // Bring a connected character's ratings and resistances in line with the
@@ -214,6 +255,92 @@ namespace
         return kept;
     }
 
+    void GiveToken(Player* player)
+    {
+        if (!player)
+            return;
+
+        ItemPosCountVec dest;
+        InventoryResult const canStore = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, cfg.TokenItem, cfg.TokenCount);
+
+        if (canStore != EQUIP_ERR_OK)
+        {
+            // Mailed rather than dropped on the floor, so a full bag is an
+            // inconvenience and not a lost reward.
+            Item* item = Item::CreateItem(cfg.TokenItem, cfg.TokenCount, player);
+            if (!item)
+                return;
+
+            CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+            item->SaveToDB(trans);
+            MailDraft(MAIL_SUBJECT_TOKEN, MAIL_BODY_TOKEN).AddItem(item)
+                .SendMailTo(trans, MailReceiver(player), MailSender(MAIL_CREATURE, cfg.BrokerEntry));
+            CharacterDatabase.CommitTransaction(trans);
+            return;
+        }
+
+        if (Item* item = player->StoreNewItem(dest, cfg.TokenItem, true))
+            player->SendNewItem(item, cfg.TokenCount, true, false);
+    }
+
+    uint32 LoadQuestRewards()
+    {
+        questRewards.clear();
+
+        QueryResult result = WorldDatabase.Query(
+            "SELECT `QuestId`, `Kind`, `Id`, `Amount`, `Weight` FROM `statbonus_quest_reward`");
+
+        if (!result)
+        {
+            LOG_INFO("module", "mod-statbonus: no quest reward pools are configured.");
+            return 0;
+        }
+
+        uint32 rows = 0;
+        uint32 skipped = 0;
+
+        do
+        {
+            Field* fields = result->Fetch();
+
+            uint32 const questId = fields[0].Get<uint32>();
+            uint8  const kind    = fields[1].Get<uint8>();
+            uint8  const id      = fields[2].Get<uint8>();
+            int32  const amount  = fields[3].Get<int32>();
+            uint32 const weight  = fields[4].Get<uint32>();
+
+            auto const slot = StatBonus::SlotOf(kind, id);
+            if (!slot)
+            {
+                LOG_ERROR("module", "mod-statbonus: quest {} rewards kind {} id {}, which is not a stat, "
+                    "rating, resistance or movement type; skipped.", questId, kind, id);
+                ++skipped;
+                continue;
+            }
+
+            if (StatBonus::IsMovement(*slot) && !StatBonus::IsAdjustableMovement(*slot))
+            {
+                LOG_ERROR("module", "mod-statbonus: quest {} rewards {}, which the core does not recalculate, "
+                    "so it could never take effect; skipped.", questId, StatBonus::SlotName(*slot));
+                ++skipped;
+                continue;
+            }
+
+            questRewards[questId].push_back({ *slot, amount, weight });
+            ++rows;
+        } while (result->NextRow());
+
+        for (auto const& [questId, pool] : questRewards)
+            if (!StatBonus::TotalWeight(pool))
+                LOG_ERROR("module", "mod-statbonus: quest {} has {} reward row(s) and they all have weight 0, "
+                    "so it will grant nothing.", questId, pool.size());
+
+        LOG_INFO("module", "mod-statbonus: loaded {} reward row(s) across {} quest(s){}.",
+            rows, questRewards.size(), skipped ? Acore::StringFormat(", skipped {} bad row(s)", skipped) : "");
+
+        return rows;
+    }
+
     void Persist(uint32 guid, std::size_t slot, int32 amount)
     {
         uint32 const kind = StatBonus::KindOf(slot);
@@ -228,6 +355,15 @@ namespace
 
         CharacterDatabase.Execute("REPLACE INTO `character_stat_bonus` (`Guid`, `Kind`, `Id`, `Amount`) VALUES ({}, {}, {}, {})",
             guid, kind, id, amount);
+    }
+
+    // Give a slot a new total, persist it, and make it visible. The command
+    // path and the quest path both end here, so they cannot drift.
+    int32 GrantSlot(Player* player, uint32 guid, std::size_t slot, int32 total)
+    {
+        store.Set(guid, slot, total);
+        Persist(guid, slot, total);
+        return total;
     }
 
     // The character sheet only changes when the numbers are recalculated, and
@@ -263,12 +399,16 @@ public:
         // The characters database is not connected yet at startup config load,
         // so the table is read from OnStartup instead.
         if (reload)
+        {
             LoadBonuses();
+            LoadQuestRewards();
+        }
     }
 
     void OnStartup() override
     {
         LoadBonuses();
+        LoadQuestRewards();
     }
 };
 
@@ -279,6 +419,9 @@ public:
         {
             PLAYERHOOK_ON_CALCULATE_STAT,
             PLAYERHOOK_ON_CALCULATE_SPEED,
+            PLAYERHOOK_ON_PLAYER_COMPLETE_QUEST,
+            PLAYERHOOK_ON_PLAYER_QUEST_ACCEPT,
+            PLAYERHOOK_ON_CREATURE_KILL,
             PLAYERHOOK_ON_LOGIN,
             PLAYERHOOK_ON_LOGOUT
         }) { }
@@ -312,6 +455,109 @@ public:
             return;
 
         rate = StatBonus::ApplyMovement(rate, percent);
+    }
+
+    // Earned, rather than granted by a GM: the quest is turned in and one of
+    // its configured outcomes is rolled.
+    //
+    // This is the end of Player::RewardQuest rather than the moment the
+    // objectives were met, which is what makes it the right hook - by now the
+    // token has been taken and the quest's own rewards handed over, so there is
+    // no window where somebody holds both the bonus and the item.
+    void OnPlayerCompleteQuest(Player* player, Quest const* quest) override
+    {
+        if (!cfg.Enable || !cfg.QuestRewards || !player || !quest)
+            return;
+
+        auto const pool = questRewards.find(quest->GetQuestId());
+        if (pool == questRewards.end())
+            return;
+
+        uint32 const total = StatBonus::TotalWeight(pool->second);
+        if (!total)
+            return;              // already shouted about at load time
+
+        auto const picked = StatBonus::PickByWeight(pool->second, urand(0, total - 1));
+        if (!picked)
+            return;
+
+        StatBonus::QuestReward const& reward = pool->second[*picked];
+
+        uint32 const guid   = player->GetGUID().GetCounter();
+        bool   const isSpeed = StatBonus::IsMovement(reward.slot);
+        int32  const limit   = isSpeed ? cfg.SpeedLimit : cfg.Limit;
+        int32  const wanted  = store.Get(guid, reward.slot) + reward.amount;
+        int32  const capped  = StatBonus::ClampToLimit(wanted, limit);
+
+        if (capped == store.Get(guid, reward.slot))
+        {
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "You are already at the limit for {}, so nothing was added.", StatBonus::SlotName(reward.slot));
+            return;
+        }
+
+        GrantSlot(player, guid, reward.slot, capped);
+        Refresh(player);
+
+        ChatHandler(player->GetSession()).PSendSysMessage("{}{:+d}{} {}|r - now {:+d}{} in total.",
+            "|cff40ff40", reward.amount, isSpeed ? "%" : "", StatBonus::SlotName(reward.slot),
+            capped, isSpeed ? "%" : "");
+    }
+
+    // The token, to everybody who was there.
+    //
+    // Loot cannot do this: a quest item only drops for somebody already on the
+    // quest, and an ordinary item drops once for one looter. Handing it over
+    // here gives every group member in the instance a copy whether or not they
+    // have the quest, which is what makes the thing repeatable in company.
+    void OnPlayerCreatureKill(Player* killer, Creature* killed) override
+    {
+        if (!cfg.Enable || !cfg.TokenItem || !killer || !killed)
+            return;
+
+        if (!tokenCreatures.count(killed->GetEntry()))
+            return;
+
+        Group* group = killer->GetGroup();
+        if (!group)
+        {
+            GiveToken(killer);
+            return;
+        }
+
+        for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+            if (Player* member = itr->GetSource())
+                if (member->GetMap() == killed->GetMap())
+                    GiveToken(member);
+    }
+
+    // The broker, called up when the quest is taken.
+    //
+    // The token starts the quest by itself - item_template.StartQuest, the way
+    // the Darkmoon decks do it - so accepting is the moment the player has
+    // asked for somebody to hand it to. Summoning here rather than from the
+    // item's own use means no spell has to exist for it, and so nothing has to
+    // be added to Spell.dbc or shipped to the client.
+    void OnPlayerQuestAccept(Player* player, Quest const* quest) override
+    {
+        if (!cfg.Enable || !cfg.BrokerEntry || !player || !quest)
+            return;
+
+        if (!questRewards.count(quest->GetQuestId()))
+            return;
+
+        if (player->IsInCombat())
+        {
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "Not while you are fighting. Try again when it is quiet.");
+            return;
+        }
+
+        float x, y, z;
+        player->GetClosePoint(x, y, z, player->GetCombatReach() / 3.0f, 2.0f);
+
+        player->SummonCreature(cfg.BrokerEntry, x, y, z, player->GetOrientation(),
+            TEMPSUMMON_TIMED_DESPAWN, cfg.BrokerSeconds * IN_MILLISECONDS);
     }
 
     void OnPlayerLogin(Player* player) override
@@ -357,6 +603,7 @@ public:
     static bool HandleStatBonusReloadCommand(ChatHandler* handler)
     {
         uint32 const count = LoadBonuses();
+        LoadQuestRewards();
 
         // Ratings and resistances are applied state, so a reload has to walk
         // the characters already on and move them to whatever the table says.

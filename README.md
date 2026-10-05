@@ -161,6 +161,54 @@ Bonuses are read into memory at startup and kept there, so the stat hook costs
 one hash lookup; when nothing is granted it costs one branch, and when only
 primary stats are granted the per-login reconciliation is skipped entirely.
 
+## Earning them
+
+A GM command is one way in. The other is a quest, which is what the realm
+actually uses: Bazil Thredd hands every member of the killing party a token,
+using the token starts a repeatable quest and calls a broker, and the turn-in
+grants one bonus rolled from a pool.
+
+Three hooks, no core change:
+
+| Step | Hook | Why there |
+| --- | --- | --- |
+| token to the party | `OnPlayerCreatureKill` on a configured creature, then a walk of the killer's group | loot cannot do it - see below |
+| broker appears | `OnPlayerQuestAccept`, for any quest with a reward pool | no spell needed, so nothing to ship to the client |
+| bonus granted | `OnPlayerCompleteQuest` | it is called at the END of `Player::RewardQuest`, so the token is already taken |
+
+That last one is worth knowing: the name suggests the moment the objectives are
+met, and it is not - `Player::CompleteQuest` does not call it. Granting at the
+objectives-met moment would have handed out the bonus while the player still
+held the token.
+
+**Why the token is not loot.** The requirement was "everyone in the party, every
+time", and `creature_loot_template` cannot express it. A quest item only drops
+for somebody already on the quest, and an ordinary item drops once, for one
+looter. So the module hands it over on the kill, to every group member in the
+same map, and mails it to anybody whose bags are full rather than dropping it on
+the floor.
+
+**Why the broker is summoned on accept.** `Archmage Vargoth's Staff` (28455) is
+the shipped precedent - a quest item whose use-spell summons the NPC who takes
+it - but that needs a spell, and a new spell needs a row in `Spell.dbc` and so a
+client patch. `item_template.StartQuest` makes the token start the quest by
+itself, the way the Darkmoon decks do, and the broker is summoned when the quest
+is accepted. One click either way.
+
+### The pool
+
+`statbonus_quest_reward` in the world database: `QuestId`, then the same
+`Kind`/`Id`/`Amount` vocabulary as everything else here, plus a `Weight`.
+Several rows sharing a `QuestId` make the quest random; one row makes it fixed,
+which is how "pick your own stat" would be built on the same machinery - several
+quests, one row each, sharing a token.
+
+The point is that what a quest can grant is **data**. A row can award a primary
+stat, any of the 25 combat ratings, a resistance or a movement percentage with
+nothing rebuilt, and `Weight` 0 retires a row without deleting it. A pool whose
+weights are all 0 grants nothing and says so at load time, rather than quietly
+falling back to the first row.
+
 ## Commands
 
     .statbonus add <player> <what> <amount>     add to what they already have

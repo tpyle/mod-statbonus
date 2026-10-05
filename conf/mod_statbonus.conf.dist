@@ -94,3 +94,47 @@ StatBonus.Limit = 0
 #        Default:     0 - (No limit)
 
 StatBonus.SpeedLimit = 0
+
+#
+#    StatBonus.QuestRewards
+#        Description: Let a quest grant a bonus on turn-in, from the pool in
+#                     the world table statbonus_quest_reward. Several rows
+#                     sharing a QuestId make the quest random, one row makes it
+#                     fixed, and the Kind/Id columns are the same vocabulary as
+#                     the commands - so a quest can award a stat, a rating, a
+#                     resistance or a movement percentage without a rebuild.
+#        Default:     1 - (Enabled)
+
+StatBonus.QuestRewards = 1
+
+#
+#    StatBonus.Token.Item / .Count / .Creatures
+#        Description: An item handed to every member of the killing party when
+#                     one of the listed creatures dies, and mailed to anybody
+#                     whose bags are full.
+#
+#                     This is done here rather than with loot because loot
+#                     cannot do it: a quest item only drops for somebody
+#                     already on the quest, and an ordinary item drops once for
+#                     one looter.
+#        Default:     0 / 1 / "" - (hand out nothing)
+
+StatBonus.Token.Item = 0
+StatBonus.Token.Count = 1
+StatBonus.Token.Creatures = ""
+
+#
+#    StatBonus.Broker.Entry / .DespawnSeconds
+#        Description: A creature summoned next to the player when they accept a
+#                     quest that has a reward pool, to take it from them, and
+#                     despawning after the given time. 0 summons nobody.
+#
+#                     Summoned on accept rather than from the item's own use
+#                     because that needs a spell, and a new spell needs a row
+#                     in Spell.dbc and so a client patch.
+#                     item_template.StartQuest makes the item start the quest by
+#                     itself, which is the same single click.
+#        Default:     0 / 120 - (summon nobody)
+
+StatBonus.Broker.Entry = 0
+StatBonus.Broker.DespawnSeconds = 120

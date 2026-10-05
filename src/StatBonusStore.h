@@ -358,6 +358,46 @@ namespace StatBonus
         return std::clamp(amount, -limit, limit);
     }
 
+    // One possible outcome of a quest that grants a bonus.
+    struct QuestReward
+    {
+        std::size_t   slot   = 0;
+        std::int32_t  amount = 0;
+        std::uint32_t weight = 1;
+    };
+
+    inline std::uint32_t TotalWeight(std::vector<QuestReward> const& pool)
+    {
+        std::uint32_t total = 0;
+        for (QuestReward const& reward : pool)
+            total += reward.weight;
+
+        return total;
+    }
+
+    // Which outcome a roll in [0, TotalWeight) lands on.
+    //
+    // Weight 0 means "never", which is how a row is retired without being
+    // deleted - useful when the pool is tuned by hand in the database. An
+    // empty pool, or one where every weight is 0, has no answer rather than a
+    // default: silently granting the first row would make a typo in the
+    // weights look like a working configuration.
+    inline std::optional<std::size_t> PickByWeight(std::vector<QuestReward> const& pool, std::uint32_t roll)
+    {
+        std::uint32_t seen = 0;
+        for (std::size_t i = 0; i < pool.size(); ++i)
+        {
+            if (!pool[i].weight)
+                continue;
+
+            seen += pool[i].weight;
+            if (roll < seen)
+                return i;
+        }
+
+        return std::nullopt;
+    }
+
     class Store
     {
     public:
