@@ -84,6 +84,7 @@
 #include "StringConvert.h"
 #include "Unit.h"
 
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -127,6 +128,16 @@ namespace
 
     // The creatures that hand out a token when they die.
     std::unordered_set<uint32> tokenCreatures;
+
+    // The roll that has already been shown to a player, by character guid and
+    // then quest id, as an index into that quest's pool.
+    //
+    // It exists because the turn-in box names the stat, which means the roll
+    // has to happen while that box is being built - one step before the reward
+    // is actually granted. Keeping it here also settles what happens when the
+    // player closes the box and reopens it: they see the same answer, rather
+    // than being able to re-roll by clicking away.
+    std::unordered_map<uint32, std::unordered_map<uint32, std::size_t>> shownRoll;
 
     void LoadConfig()
     {
@@ -457,8 +468,69 @@ public:
         rate = StatBonus::ApplyMovement(rate, percent);
     }
 
-    // Earned, rather than granted by a GM: the quest is turned in and one of
-    // its configured outcomes is rolled.
+    // Rolls the pool for a quest, or returns the roll already shown to this
+    // player for it. Nothing is granted here.
+    std::optional<std::size_t> RollFor(Player* player, uint32 questId)
+    {
+        auto const pool = questRewards.find(questId);
+        if (pool == questRewards.end())
+            return std::nullopt;
+
+        uint32 const guid = player->GetGUID().GetCounter();
+
+        auto const byQuest = shownRoll.find(guid);
+        if (byQuest != shownRoll.end())
+        {
+            auto const already = byQuest->second.find(questId);
+            if (already != byQuest->second.end())
+                return already->second;
+        }
+
+        uint32 const total = StatBonus::TotalWeight(pool->second);
+        if (!total)
+            return std::nullopt;        // already shouted about at load time
+
+        auto const picked = StatBonus::PickByWeight(pool->second, urand(0, total - 1));
+        if (picked)
+            shownRoll[guid][questId] = *picked;
+
+        return picked;
+    }
+
+    // Puts the rolled stat into the turn-in box.
+    //
+    // This is the only place it can go. quest_offer_reward.RewardText is one
+    // static string shared by everybody, and the packet carrying it is the
+    // last thing sent before the reward is handed over, so the roll has to be
+    // decided here rather than in OnPlayerCompleteQuest, which runs after the
+    // player has already read the text.
+    //
+    // %stat is substituted; a pool quest whose text forgot the token gets the
+    // answer appended rather than losing it silently.
+    void OnPlayerQuestOfferRewardText(Player* player, Quest const* quest, std::string& text) override
+    {
+        if (!cfg.Enable || !cfg.QuestRewards || !player || !quest)
+            return;
+
+        auto const picked = RollFor(player, quest->GetQuestId());
+        if (!picked)
+            return;
+
+        StatBonus::QuestReward const& reward = questRewards[quest->GetQuestId()][*picked];
+        bool const isSpeed = StatBonus::IsMovement(reward.slot);
+
+        std::string const named = Acore::StringFormat("{:+d}{} {}",
+            reward.amount, isSpeed ? "%" : "", StatBonus::SlotName(reward.slot));
+
+        std::string::size_type const token = text.find("%stat");
+        if (token != std::string::npos)
+            text.replace(token, 5, named);
+        else
+            text.append("$B$BWhat it was carrying: ").append(named).append(".");
+    }
+
+    // Earned, rather than granted by a GM: the quest is turned in and the roll
+    // the player was shown in the turn-in box is paid out.
     //
     // This is the end of Player::RewardQuest rather than the moment the
     // objectives were met, which is what makes it the right hook - by now the
@@ -469,25 +541,21 @@ public:
         if (!cfg.Enable || !cfg.QuestRewards || !player || !quest)
             return;
 
-        auto const pool = questRewards.find(quest->GetQuestId());
-        if (pool == questRewards.end())
-            return;
-
-        uint32 const total = StatBonus::TotalWeight(pool->second);
-        if (!total)
-            return;              // already shouted about at load time
-
-        auto const picked = StatBonus::PickByWeight(pool->second, urand(0, total - 1));
+        // Normally this is the roll the player was just shown. It rolls fresh
+        // only for a turn-in that never drew the box at all.
+        auto const picked = RollFor(player, quest->GetQuestId());
         if (!picked)
             return;
 
-        StatBonus::QuestReward const& reward = pool->second[*picked];
+        StatBonus::QuestReward const& reward = questRewards[quest->GetQuestId()][*picked];
 
-        uint32 const guid   = player->GetGUID().GetCounter();
+        uint32 const guid    = player->GetGUID().GetCounter();
         bool   const isSpeed = StatBonus::IsMovement(reward.slot);
         int32  const limit   = isSpeed ? cfg.SpeedLimit : cfg.Limit;
         int32  const wanted  = store.Get(guid, reward.slot) + reward.amount;
         int32  const capped  = StatBonus::ClampToLimit(wanted, limit);
+
+        shownRoll[guid].erase(quest->GetQuestId());   // spent; the next one rolls again
 
         if (capped == store.Get(guid, reward.slot))
         {
@@ -572,6 +640,7 @@ public:
     void OnPlayerLogout(Player* player) override
     {
         applied.erase(player->GetGUID().GetCounter());
+        shownRoll.erase(player->GetGUID().GetCounter());
     }
 };
 
