@@ -67,6 +67,7 @@
 
 #include "Chat.h"
 #include "ChatCommand.h"
+#include "Creature.h"
 #include "Config.h"
 #include "DatabaseEnv.h"
 #include "Group.h"
@@ -79,6 +80,8 @@
 #include "QuestDef.h"
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
+#include "SpellInfo.h"
+#include "SpellMgr.h"
 #include "StringFormat.h"
 #include "Tokenize.h"
 #include "StringConvert.h"
@@ -111,6 +114,28 @@ namespace
 
     Config cfg;
     StatBonus::Store store;
+
+    // Calls the broker up next to the player. Shared by the two ways of asking
+    // for one: taking the quest from the token, and clicking the token again
+    // afterwards.
+    bool SummonBroker(Player* player)
+    {
+        if (!cfg.BrokerEntry || !player)
+            return false;
+
+        if (player->IsInCombat())
+        {
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "Not while you are fighting. Try again when it is quiet.");
+            return false;
+        }
+
+        float x, y, z;
+        player->GetClosePoint(x, y, z, player->GetCombatReach() / 3.0f, 2.0f);
+
+        return player->SummonCreature(cfg.BrokerEntry, x, y, z, player->GetOrientation(),
+            TEMPSUMMON_TIMED_DESPAWN, cfg.BrokerSeconds * IN_MILLISECONDS) != nullptr;
+    }
 
     constexpr char const* MAIL_SUBJECT_TOKEN = "Your share";
     constexpr char const* MAIL_BODY_TOKEN =
@@ -431,6 +456,7 @@ public:
             PLAYERHOOK_ON_CALCULATE_STAT,
             PLAYERHOOK_ON_CALCULATE_SPEED,
             PLAYERHOOK_ON_PLAYER_COMPLETE_QUEST,
+            PLAYERHOOK_ON_QUEST_OFFER_REWARD_TEXT,
             PLAYERHOOK_ON_PLAYER_QUEST_ACCEPT,
             PLAYERHOOK_ON_CREATURE_KILL,
             PLAYERHOOK_ON_LOGIN,
@@ -608,24 +634,13 @@ public:
     // be added to Spell.dbc or shipped to the client.
     void OnPlayerQuestAccept(Player* player, Quest const* quest) override
     {
-        if (!cfg.Enable || !cfg.BrokerEntry || !player || !quest)
+        if (!cfg.Enable || !player || !quest)
             return;
 
         if (!questRewards.count(quest->GetQuestId()))
             return;
 
-        if (player->IsInCombat())
-        {
-            ChatHandler(player->GetSession()).PSendSysMessage(
-                "Not while you are fighting. Try again when it is quiet.");
-            return;
-        }
-
-        float x, y, z;
-        player->GetClosePoint(x, y, z, player->GetCombatReach() / 3.0f, 2.0f);
-
-        player->SummonCreature(cfg.BrokerEntry, x, y, z, player->GetOrientation(),
-            TEMPSUMMON_TIMED_DESPAWN, cfg.BrokerSeconds * IN_MILLISECONDS);
+        SummonBroker(player);
     }
 
     void OnPlayerLogin(Player* player) override
@@ -906,9 +921,61 @@ private:
     }
 };
 
+// The token, clicked again once the quest is already taken.
+//
+// It carries a spell purely so the client offers it. Whether an item is usable
+// at all - the "Use:" line on the tooltip, and whether a right-click sends
+// CMSG_USE_ITEM - is decided by the client alone, out of its own Spell.dbc.
+// The spell this feature actually wants lives in the spell_dbc world table,
+// which is a server-side overlay the client never sees, so a token carrying it
+// showed no Use: line and right-clicked into nothing. Confirmed rather than
+// assumed: a probe item identical to the token but carrying a stock spell id
+// did show the line.
+//
+// So the item's spell is a doorbell. OnUse returns true, which stops
+// WorldSession::HandleUseItemOpcode before CastItemUseSpell, and whatever that
+// spell would really have done never happens. Nothing has to be added to the
+// client's Spell.dbc and nothing has to be shipped to anybody.
+class StatBonus_TokenItemScript : public ItemScript
+{
+public:
+    StatBonus_TokenItemScript() : ItemScript("item_statbonus_token") { }
+
+    bool OnUse(Player* player, Item* item, SpellCastTargets const& /*targets*/) override
+    {
+        if (!player || !item)
+            return false;
+
+        // The handler's own warning: a script that stops the cast has to tell
+        // the client, or the item sits greyed out as though still being used.
+        player->SendEquipError(EQUIP_ERR_NONE, item, nullptr);
+
+        if (!cfg.Enable || !cfg.QuestRewards || !cfg.BrokerEntry)
+            return true;
+
+        if (player->FindNearestCreature(cfg.BrokerEntry, 30.0f))
+        {
+            ChatHandler(player->GetSession()).PSendSysMessage("Already here, and waiting.");
+            return true;
+        }
+
+        if (!SummonBroker(player))
+            return true;              // it said why
+
+        // The cooldown CastItemUseSpell would have applied. Read off the item
+        // rather than named here, so spellcooldown_1 in item_template stays
+        // the one place it is set.
+        if (SpellInfo const* doorbell = sSpellMgr->GetSpellInfo(item->GetTemplate()->Spells[0].SpellId))
+            player->SendCooldownEvent(doorbell, item->GetEntry());
+
+        return true;
+    }
+};
+
 void AddStatBonusScripts()
 {
     new StatBonus_WorldScript();
     new StatBonus_PlayerScript();
     new StatBonus_CommandScript();
+    new StatBonus_TokenItemScript();
 }
