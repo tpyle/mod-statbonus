@@ -115,7 +115,8 @@ namespace
         // Drop chances, as a percent rolled per player. 0 switches a source
         // off, so there is one dial per source and no separate enable.
         uint32      TokenChance        = 100;  // the named creatures below
-        uint32      TokenDungeonChance = 0;    // final boss of a normal/heroic dungeon
+        uint32      TokenDungeonChance = 0;    // final boss of a normal dungeon
+        uint32      TokenHeroicChance  = 0;    // final boss of a heroic dungeon
         uint32      TokenRaidChance    = 0;    // final boss of a raid
         bool        TokenSkipBots      = true;
         std::string TokenCreatures;        // comma separated creature entries
@@ -186,6 +187,7 @@ namespace
         cfg.QuestRewards  = sConfigMgr->GetOption<bool>("StatBonus.QuestRewards", true);
         cfg.TokenChance        = sConfigMgr->GetOption<uint32>("StatBonus.Token.Chance", 100);
         cfg.TokenDungeonChance = sConfigMgr->GetOption<uint32>("StatBonus.Token.DungeonChance", 0);
+        cfg.TokenHeroicChance  = sConfigMgr->GetOption<uint32>("StatBonus.Token.HeroicChance", 0);
         cfg.TokenRaidChance    = sConfigMgr->GetOption<uint32>("StatBonus.Token.RaidChance", 0);
         cfg.TokenSkipBots      = sConfigMgr->GetOption<bool>("StatBonus.Token.SkipBots", true);
         cfg.BrokerEntry   = sConfigMgr->GetOption<uint32>("StatBonus.Broker.Entry", 0);
@@ -1023,8 +1025,9 @@ public:
 // call a completed dungeon is exactly what is caught here.
 //
 // 127 encounters are marked final in this database, which is why the type is
-// checked: 92 are dungeons and 35 are raids, Naxxramas and Icecrown among
-// them. A chance of 0 for raids keeps Arthas out of it until asked otherwise.
+// checked rather than assumed: 60 are normal dungeons, 32 are heroics, and 35
+// are raids with Naxxramas and Icecrown among them. Each bucket has its own
+// chance, and 0 for raids keeps Arthas out of it until asked otherwise.
 //
 // Deliberately not gated on the hook's `updated` flag. That is only ever set
 // when the boss sat under an InstanceScript, and most of the classic dungeons
@@ -1053,8 +1056,10 @@ public:
         switch (dungeon->type)
         {
             case lfg::LFG_TYPE_DUNGEON:
-            case lfg::LFG_TYPE_HEROIC:
                 chance = cfg.TokenDungeonChance;
+                break;
+            case lfg::LFG_TYPE_HEROIC:
+                chance = cfg.TokenHeroicChance;
                 break;
             case lfg::LFG_TYPE_RAID:
                 chance = cfg.TokenRaidChance;

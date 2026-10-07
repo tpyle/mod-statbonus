@@ -124,31 +124,33 @@ StatBonus.Token.Count = 1
 StatBonus.Token.Creatures = ""
 
 #
-#    StatBonus.Token.Chance / .DungeonChance / .RaidChance
+#    StatBonus.Token.Chance / .DungeonChance / .HeroicChance / .RaidChance
 #        Description: Drop chances for the token, as a percent rolled per
 #                     player. 0 switches a source off, so there is one dial per
 #                     source and no separate enable.
 #
 #                     .Chance covers the creatures named above.
 #
-#                     .DungeonChance and .RaidChance cover the final boss of
-#                     anything the dungeon finder would pay a random-dungeon
-#                     bag for. That is not a list kept here: instance_encounters
+#                     The other three cover the final boss of anything the
+#                     dungeon finder would pay a random-dungeon bag for. That
+#                     is not a list kept here: instance_encounters
 #                     marks an encounter as finishing a dungeon with its
 #                     lastEncounterDungeon column, and this reads the same
 #                     dungeon id out of the same place the finder does, so the
 #                     two can never disagree about what the last boss is.
 #
-#                     They are separate because that set spans both: of the 127
-#                     encounters marked final, 92 are dungeons and 35 are raids
-#                     up to and including Icecrown Citadel.
+#                     They are separate because that set spans all three: of
+#                     the 127 encounters marked final, 60 are normal dungeons,
+#                     32 are heroics, and 35 are raids up to and including
+#                     Icecrown Citadel.
 #
 #                     Rolled per player, so a chance below 100 is each person's
 #                     own luck rather than everybody sharing one result.
-#        Default:     100 / 0 / 0 - (named creatures always, bosses never)
+#        Default:     100 / 0 / 0 / 0 - (named creatures always, bosses never)
 
 StatBonus.Token.Chance = 100
 StatBonus.Token.DungeonChance = 0
+StatBonus.Token.HeroicChance = 0
 StatBonus.Token.RaidChance = 0
 
 #
