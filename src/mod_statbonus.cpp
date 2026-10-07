@@ -71,6 +71,8 @@
 #include "Config.h"
 #include "DatabaseEnv.h"
 #include "Group.h"
+#include "LFGMgr.h"
+#include "Map.h"
 #include "Item.h"
 #include "Mail.h"
 #include "Language.h"
@@ -86,6 +88,7 @@
 #include "Tokenize.h"
 #include "StringConvert.h"
 #include "Unit.h"
+#include "WorldSession.h"
 
 #include <optional>
 #include <string>
@@ -109,6 +112,12 @@ namespace
         uint32      BrokerSeconds  = 120;
         uint32      TokenItem      = 0;    // 0 = hand out nothing
         uint32      TokenCount     = 1;
+        // Drop chances, as a percent rolled per player. 0 switches a source
+        // off, so there is one dial per source and no separate enable.
+        uint32      TokenChance        = 100;  // the named creatures below
+        uint32      TokenDungeonChance = 0;    // final boss of a normal/heroic dungeon
+        uint32      TokenRaidChance    = 0;    // final boss of a raid
+        bool        TokenSkipBots      = true;
         std::string TokenCreatures;        // comma separated creature entries
     };
 
@@ -175,6 +184,10 @@ namespace
         cfg.SpeedLimit = sConfigMgr->GetOption<int32>("StatBonus.SpeedLimit", 0);
 
         cfg.QuestRewards  = sConfigMgr->GetOption<bool>("StatBonus.QuestRewards", true);
+        cfg.TokenChance        = sConfigMgr->GetOption<uint32>("StatBonus.Token.Chance", 100);
+        cfg.TokenDungeonChance = sConfigMgr->GetOption<uint32>("StatBonus.Token.DungeonChance", 0);
+        cfg.TokenRaidChance    = sConfigMgr->GetOption<uint32>("StatBonus.Token.RaidChance", 0);
+        cfg.TokenSkipBots      = sConfigMgr->GetOption<bool>("StatBonus.Token.SkipBots", true);
         cfg.BrokerEntry   = sConfigMgr->GetOption<uint32>("StatBonus.Broker.Entry", 0);
         cfg.BrokerSeconds = sConfigMgr->GetOption<uint32>("StatBonus.Broker.DespawnSeconds", 120);
         cfg.TokenItem     = sConfigMgr->GetOption<uint32>("StatBonus.Token.Item", 0);
@@ -291,6 +304,14 @@ namespace
         return kept;
     }
 
+    bool IsBot(Player const* player)
+    {
+        // IsHeadless and not IsBot: upstream's headless session work renamed
+        // the idea, and the predicate is the same one - a session with no
+        // socket behind it, which is what mod-playerbots fabricates.
+        return player && player->GetSession() && player->GetSession()->IsHeadless();
+    }
+
     void GiveToken(Player* player)
     {
         if (!player)
@@ -317,6 +338,25 @@ namespace
 
         if (Item* item = player->StoreNewItem(dest, cfg.TokenItem, true))
             player->SendNewItem(item, cfg.TokenCount, true, false);
+    }
+
+    // One player's roll for one kill.
+    //
+    // Rolled per player rather than once for the group, so a chance below 100
+    // means each person's own luck rather than everybody sharing one result.
+    // At 100 this is the old behaviour exactly.
+    void MaybeGiveToken(Player* player, uint32 chance)
+    {
+        if (!player || !chance)
+            return;
+
+        if (cfg.TokenSkipBots && IsBot(player))
+            return;             // it would never be turned in
+
+        if (chance < 100 && urand(1, 100) > chance)
+            return;
+
+        GiveToken(player);
     }
 
     uint32 LoadQuestRewards()
@@ -615,14 +655,14 @@ public:
         Group* group = killer->GetGroup();
         if (!group)
         {
-            GiveToken(killer);
+            MaybeGiveToken(killer, cfg.TokenChance);
             return;
         }
 
         for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
             if (Player* member = itr->GetSource())
                 if (member->GetMap() == killed->GetMap())
-                    GiveToken(member);
+                    MaybeGiveToken(member, cfg.TokenChance);
     }
 
     // The broker, called up when the quest is taken.
@@ -972,10 +1012,75 @@ public:
     }
 };
 
+// The token, from the final boss of a dungeon.
+//
+// Reuses the core's own idea of "last boss", rather than a list of creature
+// entries that would have to be kept by hand: instance_encounters carries a
+// lastEncounterDungeon column naming the LFG dungeon an encounter finishes,
+// and Map::UpdateEncounterState is where that is read - it is what tells the
+// dungeon finder to pay out the random-dungeon bag. The hook fires right
+// beside that payout with the same dungeon id, so anything the finder would
+// call a completed dungeon is exactly what is caught here.
+//
+// 127 encounters are marked final in this database, which is why the type is
+// checked: 92 are dungeons and 35 are raids, Naxxramas and Icecrown among
+// them. A chance of 0 for raids keeps Arthas out of it until asked otherwise.
+//
+// Deliberately not gated on the hook's `updated` flag. That is only ever set
+// when the boss sat under an InstanceScript, and most of the classic dungeons
+// have none - gating on it would have quietly excluded the older half of the
+// list, which is the half most of these bosses are in.
+class StatBonus_GlobalScript : public GlobalScript
+{
+public:
+    StatBonus_GlobalScript() : GlobalScript("StatBonus_GlobalScript",
+        {
+            GLOBALHOOK_ON_AFTER_UPDATE_ENCOUNTER_STATE
+        }) { }
+
+    void OnAfterUpdateEncounterState(Map* map, EncounterCreditType /*type*/, uint32 /*creditEntry*/,
+        Unit* /*source*/, Difficulty /*difficulty*/, DungeonEncounterList const* /*encounters*/,
+        uint32 dungeonCompleted, bool /*updated*/) override
+    {
+        if (!cfg.Enable || !cfg.TokenItem || !map || !dungeonCompleted)
+            return;
+
+        lfg::LFGDungeonData const* dungeon = sLFGMgr->GetLFGDungeon(dungeonCompleted);
+        if (!dungeon)
+            return;
+
+        uint32 chance = 0;
+        switch (dungeon->type)
+        {
+            case lfg::LFG_TYPE_DUNGEON:
+            case lfg::LFG_TYPE_HEROIC:
+                chance = cfg.TokenDungeonChance;
+                break;
+            case lfg::LFG_TYPE_RAID:
+                chance = cfg.TokenRaidChance;
+                break;
+            default:
+                return;
+        }
+
+        if (!chance)
+            return;
+
+        // Everybody on the map, not everybody in the group: inside an instance
+        // those are the same people, and this way somebody who came in ungrouped
+        // is not skipped.
+        Map::PlayerList const& players = map->GetPlayers();
+        for (Map::PlayerList::const_iterator itr = players.begin(); itr != players.end(); ++itr)
+            if (Player* player = itr->GetSource())
+                MaybeGiveToken(player, chance);
+    }
+};
+
 void AddStatBonusScripts()
 {
     new StatBonus_WorldScript();
     new StatBonus_PlayerScript();
     new StatBonus_CommandScript();
     new StatBonus_TokenItemScript();
+    new StatBonus_GlobalScript();
 }

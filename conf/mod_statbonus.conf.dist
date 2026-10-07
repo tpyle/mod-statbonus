@@ -124,6 +124,42 @@ StatBonus.Token.Count = 1
 StatBonus.Token.Creatures = ""
 
 #
+#    StatBonus.Token.Chance / .DungeonChance / .RaidChance
+#        Description: Drop chances for the token, as a percent rolled per
+#                     player. 0 switches a source off, so there is one dial per
+#                     source and no separate enable.
+#
+#                     .Chance covers the creatures named above.
+#
+#                     .DungeonChance and .RaidChance cover the final boss of
+#                     anything the dungeon finder would pay a random-dungeon
+#                     bag for. That is not a list kept here: instance_encounters
+#                     marks an encounter as finishing a dungeon with its
+#                     lastEncounterDungeon column, and this reads the same
+#                     dungeon id out of the same place the finder does, so the
+#                     two can never disagree about what the last boss is.
+#
+#                     They are separate because that set spans both: of the 127
+#                     encounters marked final, 92 are dungeons and 35 are raids
+#                     up to and including Icecrown Citadel.
+#
+#                     Rolled per player, so a chance below 100 is each person's
+#                     own luck rather than everybody sharing one result.
+#        Default:     100 / 0 / 0 - (named creatures always, bosses never)
+
+StatBonus.Token.Chance = 100
+StatBonus.Token.DungeonChance = 0
+StatBonus.Token.RaidChance = 0
+
+#
+#    StatBonus.Token.SkipBots
+#        Description: Do not hand tokens to playerbots, which would never turn
+#                     them in.
+#        Default:     1 - (Enabled)
+
+StatBonus.Token.SkipBots = 1
+
+#
 #    StatBonus.Broker.Entry / .DespawnSeconds
 #        Description: A creature summoned next to the player when they accept a
 #                     quest that has a reward pool, to take it from them, and
