@@ -96,6 +96,26 @@ StatBonus.Limit = 0
 StatBonus.SpeedLimit = 0
 
 #
+#    StatBonus.Quest.Enable
+#        Description: The quest chain: the fragment that starts it, the broker
+#                     who takes it, and the turn-in that pays the bonus.
+#
+#                     This is the master switch, where .QuestRewards below only
+#                     stops the payout. Off, the chain goes dormant rather than
+#                     half-working: no broker is summoned, no bonus is paid, a
+#                     fragment still in a bag says nothing answers, and
+#                     accepting the quest tells the player to abandon it. That
+#                     last one is needed because the quest is started by an
+#                     item and there is no hook to refuse an accept, so a
+#                     fragment picked up before the switch can still open it.
+#
+#                     The quest itself is left in the database untouched, so
+#                     turning this back on restores it as it was.
+#        Default:     1 - (Enabled)
+
+StatBonus.Quest.Enable = 1
+
+#
 #    StatBonus.QuestRewards
 #        Description: Let a quest grant a bonus on turn-in, from the pool in
 #                     the world table statbonus_quest_reward. Several rows
@@ -108,18 +128,31 @@ StatBonus.SpeedLimit = 0
 StatBonus.QuestRewards = 1
 
 #
-#    StatBonus.Token.Item / .Count / .Creatures
-#        Description: An item handed to every member of the killing party when
-#                     one of the listed creatures dies, and mailed to anybody
-#                     whose bags are full.
+#    StatBonus.Token.Items / .Count / .Creatures
+#        Description: The items handed to every member of the killing party
+#                     when one of the listed creatures dies, and mailed to
+#                     anybody whose bags are full.
 #
 #                     This is done here rather than with loot because loot
 #                     cannot do it: a quest item only drops for somebody
 #                     already on the quest, and an ordinary item drops once for
 #                     one looter.
-#        Default:     0 / 1 / "" - (hand out nothing)
+#
+#                     A comma separated list, and ONE ROLL PICKS ONE ENTRY.
+#                     That is the whole point of the list: five items behind a
+#                     10% boss stay a 10% chance of getting one of them, where
+#                     rolling each separately would mean the same dial handing
+#                     out five times as much loot. Adding an item therefore
+#                     changes what drops and not how often.
+#
+#                     The pick is unweighted. What each item grants is
+#                     weighted, in statbonus_item_reward.
+#
+#                     StatBonus.Token.Item - the old name, from when only one
+#                     was possible - is still read when .Items is unset.
+#        Default:     "" / 1 / "" - (hand out nothing)
 
-StatBonus.Token.Item = 0
+StatBonus.Token.Items = ""
 StatBonus.Token.Count = 1
 StatBonus.Token.Creatures = ""
 
@@ -155,8 +188,8 @@ StatBonus.Token.RaidChance = 0
 
 #
 #    StatBonus.Token.SkipBots
-#        Description: Do not hand tokens to playerbots, which would never turn
-#                     them in.
+#        Description: Do not hand tokens to playerbots, which would never use
+#                     them or turn them in.
 #        Default:     1 - (Enabled)
 
 StatBonus.Token.SkipBots = 1

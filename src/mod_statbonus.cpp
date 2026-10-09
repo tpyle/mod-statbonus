@@ -108,10 +108,20 @@ namespace
         int32 SpeedLimit = 0;   // 0 = no limit, in percentage points
 
         // Earning them, rather than being given them by a GM.
+        //
+        // Quest is the master switch for the quest chain - the fragment, the
+        // broker and the turn-in - where QuestRewards only stops the payout.
+        // Off, the chain goes dormant rather than half-working: no broker is
+        // summoned, no bonus is paid, and a fragment still in somebody's bag
+        // says so instead of silently doing nothing.
+        bool        Quest          = true;
         bool        QuestRewards   = true;
         uint32      BrokerEntry    = 0;    // 0 = summon nobody
         uint32      BrokerSeconds  = 120;
-        uint32      TokenItem      = 0;    // 0 = hand out nothing
+        // What a kill hands out. Empty hands out nothing; more than one entry
+        // is picked between at random, which is the difference between adding
+        // items and multiplying the drop rate - see GiveToken.
+        std::vector<uint32> TokenItems;
         uint32      TokenCount     = 1;
         // Drop chances, as a percent rolled per player. 0 switches a source
         // off, so there is one dial per source and no separate enable.
@@ -189,6 +199,7 @@ namespace
         // grant is hundreds, would allow a character twenty times normal speed.
         cfg.SpeedLimit = sConfigMgr->GetOption<int32>("StatBonus.SpeedLimit", 0);
 
+        cfg.Quest         = sConfigMgr->GetOption<bool>("StatBonus.Quest.Enable", true);
         cfg.QuestRewards  = sConfigMgr->GetOption<bool>("StatBonus.QuestRewards", true);
         cfg.TokenChance        = sConfigMgr->GetOption<uint32>("StatBonus.Token.Chance", 100);
         cfg.TokenDungeonChance = sConfigMgr->GetOption<uint32>("StatBonus.Token.DungeonChance", 0);
@@ -197,9 +208,26 @@ namespace
         cfg.TokenSkipBots      = sConfigMgr->GetOption<bool>("StatBonus.Token.SkipBots", true);
         cfg.BrokerEntry   = sConfigMgr->GetOption<uint32>("StatBonus.Broker.Entry", 0);
         cfg.BrokerSeconds = sConfigMgr->GetOption<uint32>("StatBonus.Broker.DespawnSeconds", 120);
-        cfg.TokenItem     = sConfigMgr->GetOption<uint32>("StatBonus.Token.Item", 0);
         cfg.TokenCount    = sConfigMgr->GetOption<uint32>("StatBonus.Token.Count", 1);
         cfg.TokenCreatures = sConfigMgr->GetOption<std::string>("StatBonus.Token.Creatures", "");
+
+        // .Items is the current name and takes a list. .Item is what it used
+        // to be called when only one was possible, and is still read so an
+        // existing config keeps working rather than quietly handing out
+        // nothing.
+        std::string items = sConfigMgr->GetOption<std::string>("StatBonus.Token.Items", "");
+        if (items.empty())
+            items = sConfigMgr->GetOption<std::string>("StatBonus.Token.Item", "");
+
+        cfg.TokenItems.clear();
+        for (std::string_view const field : Acore::Tokenize(items, ',', false))
+            if (Optional<uint32> const entry = Acore::StringTo<uint32>(field))
+            {
+                if (*entry)
+                    cfg.TokenItems.push_back(*entry);   // 0 is the old "hand out nothing"
+            }
+            else
+                LOG_ERROR("module", "mod-statbonus: '{}' in StatBonus.Token.Items is not an item entry", field);
 
         tokenCreatures.clear();
         for (std::string_view const field : Acore::Tokenize(cfg.TokenCreatures, ',', false))
@@ -319,31 +347,56 @@ namespace
         return player && player->GetSession() && player->GetSession()->IsHeadless();
     }
 
+    // One of the configured items, to one player.
+    //
+    // ONE ROLL PICKS ONE ITEM, which is what keeps a list from multiplying the
+    // drop rate: five motes behind a 10% boss are a 10% chance of a mote, not
+    // five 10% chances. The alternative - rolling each entry separately - is
+    // the same dial meaning five times as much loot as soon as a second item
+    // is added, which is not what "the same drop rate" means to anybody.
+    //
+    // Unweighted on purpose. Which stat a mote carries is already a choice the
+    // player makes by deciding which to use, so weighting the drop would be a
+    // second opinion about the same thing; what each one grants is weighted,
+    // in statbonus_item_reward.
     void GiveToken(Player* player)
     {
-        if (!player)
+        if (!player || cfg.TokenItems.empty())
             return;
 
+        uint32 const entry = cfg.TokenItems.size() == 1
+            ? cfg.TokenItems.front()
+            : cfg.TokenItems[urand(0, static_cast<uint32>(cfg.TokenItems.size()) - 1)];
+
         ItemPosCountVec dest;
-        InventoryResult const canStore = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, cfg.TokenItem, cfg.TokenCount);
+        InventoryResult const canStore = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, entry, cfg.TokenCount);
 
         if (canStore != EQUIP_ERR_OK)
         {
             // Mailed rather than dropped on the floor, so a full bag is an
             // inconvenience and not a lost reward.
-            Item* item = Item::CreateItem(cfg.TokenItem, cfg.TokenCount, player);
+            Item* item = Item::CreateItem(entry, cfg.TokenCount, player);
             if (!item)
                 return;
+
+            // From the broker when there is one, and otherwise as system mail,
+            // which is the core's own fallback in ServerMailMgr. It matters
+            // because the broker belongs to the quest chain: with the chain off
+            // its entry may well be 0, and mail from creature 0 has no sender
+            // the client can name.
+            MailSender const sender = cfg.BrokerEntry
+                ? MailSender(MAIL_CREATURE, cfg.BrokerEntry)
+                : MailSender(MAIL_NORMAL, player->GetGUID().GetCounter(), MAIL_STATIONERY_GM);
 
             CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
             item->SaveToDB(trans);
             MailDraft(MAIL_SUBJECT_TOKEN, MAIL_BODY_TOKEN).AddItem(item)
-                .SendMailTo(trans, MailReceiver(player), MailSender(MAIL_CREATURE, cfg.BrokerEntry));
+                .SendMailTo(trans, MailReceiver(player), sender);
             CharacterDatabase.CommitTransaction(trans);
             return;
         }
 
-        if (Item* item = player->StoreNewItem(dest, cfg.TokenItem, true))
+        if (Item* item = player->StoreNewItem(dest, entry, true))
             player->SendNewItem(item, cfg.TokenCount, true, false);
     }
 
@@ -358,7 +411,7 @@ namespace
             return;
 
         if (cfg.TokenSkipBots && IsBot(player))
-            return;             // it would never be turned in
+            return;             // a bot would never use it or turn it in
 
         if (chance < 100 && urand(1, 100) > chance)
             return;
@@ -599,7 +652,7 @@ public:
     // answer appended rather than losing it silently.
     void OnPlayerQuestOfferRewardText(Player* player, Quest const* quest, std::string& text) override
     {
-        if (!cfg.Enable || !cfg.QuestRewards || !player || !quest)
+        if (!cfg.Enable || !cfg.Quest || !cfg.QuestRewards || !player || !quest)
             return;
 
         auto const picked = RollFor(player, quest->GetQuestId());
@@ -628,7 +681,7 @@ public:
     // no window where somebody holds both the bonus and the item.
     void OnPlayerCompleteQuest(Player* player, Quest const* quest) override
     {
-        if (!cfg.Enable || !cfg.QuestRewards || !player || !quest)
+        if (!cfg.Enable || !cfg.Quest || !cfg.QuestRewards || !player || !quest)
             return;
 
         // Normally this is the roll the player was just shown. It rolls fresh
@@ -670,7 +723,7 @@ public:
     // have the quest, which is what makes the thing repeatable in company.
     void OnPlayerCreatureKill(Player* killer, Creature* killed) override
     {
-        if (!cfg.Enable || !cfg.TokenItem || !killer || !killed)
+        if (!cfg.Enable || cfg.TokenItems.empty() || !killer || !killed)
             return;
 
         if (!tokenCreatures.count(killed->GetEntry()))
@@ -703,6 +756,17 @@ public:
 
         if (!questRewards.count(quest->GetQuestId()))
             return;
+
+        // With the chain off, say so here rather than just not summoning. The
+        // quest is started by an item, and a fragment picked up before the
+        // switch can still open it - there is no hook to refuse an accept - so
+        // without this the player waits for a broker that is never coming.
+        if (!cfg.Quest)
+        {
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "Nobody comes. This one has been set aside for now - you may as well abandon it.");
+            return;
+        }
 
         SummonBroker(player);
     }
@@ -1015,7 +1079,17 @@ public:
         // the client, or the item sits greyed out as though still being used.
         player->SendEquipError(EQUIP_ERR_NONE, item, nullptr);
 
-        if (!cfg.Enable || !cfg.QuestRewards || !cfg.BrokerEntry)
+        // Dormant, rather than inert: a fragment is bind-on-pickup and may well
+        // be sitting in a bag from before the chain was switched off, and an
+        // item that does nothing at all when clicked reads as a bug.
+        if (!cfg.Enable || !cfg.Quest)
+        {
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "Nothing answers. Whatever was listening on the other side has stopped.");
+            return true;
+        }
+
+        if (!cfg.QuestRewards || !cfg.BrokerEntry)
             return true;
 
         if (player->FindNearestCreature(cfg.BrokerEntry, 30.0f))
@@ -1068,7 +1142,7 @@ public:
         Unit* /*source*/, Difficulty /*difficulty*/, DungeonEncounterList const* /*encounters*/,
         uint32 dungeonCompleted, bool /*updated*/) override
     {
-        if (!cfg.Enable || !cfg.TokenItem || !map || !dungeonCompleted)
+        if (!cfg.Enable || cfg.TokenItems.empty() || !map || !dungeonCompleted)
             return;
 
         lfg::LFGDungeonData const* dungeon = sLFGMgr->GetLFGDungeon(dungeonCompleted);
