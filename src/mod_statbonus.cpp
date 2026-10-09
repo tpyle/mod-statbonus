@@ -161,6 +161,10 @@ namespace
     // is tuned with an UPDATE and a ".statbonus reload" rather than a build.
     std::unordered_map<uint32, std::vector<StatBonus::QuestReward>> questRewards;
 
+    // itemId -> what using it grants. Same shape as questRewards, read from
+    // its own table.
+    std::unordered_map<uint32, std::vector<StatBonus::QuestReward>> itemRewards;
+
     // The creatures that hand out a token when they die.
     std::unordered_set<uint32> tokenCreatures;
 
@@ -361,16 +365,20 @@ namespace
         GiveToken(player);
     }
 
-    uint32 LoadQuestRewards()
+    // Reads one reward-pool table. Shared by the quest and item pools, which
+    // differ only in the table and the word used when complaining about a bad
+    // row - and a copy of this would be the obvious place for the two to drift.
+    uint32 LoadRewardPool(char const* table, char const* keyColumn, char const* subject,
+        std::unordered_map<uint32, std::vector<StatBonus::QuestReward>>& into)
     {
-        questRewards.clear();
+        into.clear();
 
         QueryResult result = WorldDatabase.Query(
-            "SELECT `QuestId`, `Kind`, `Id`, `Amount`, `Weight` FROM `statbonus_quest_reward`");
+            "SELECT `{}`, `Kind`, `Id`, `Amount`, `Weight` FROM `{}`", keyColumn, table);
 
         if (!result)
         {
-            LOG_INFO("module", "mod-statbonus: no quest reward pools are configured.");
+            LOG_INFO("module", "mod-statbonus: no {} reward pools are configured.", subject);
             return 0;
         }
 
@@ -381,43 +389,54 @@ namespace
         {
             Field* fields = result->Fetch();
 
-            uint32 const questId = fields[0].Get<uint32>();
-            uint8  const kind    = fields[1].Get<uint8>();
-            uint8  const id      = fields[2].Get<uint8>();
-            int32  const amount  = fields[3].Get<int32>();
-            uint32 const weight  = fields[4].Get<uint32>();
+            uint32 const key    = fields[0].Get<uint32>();
+            uint8  const kind   = fields[1].Get<uint8>();
+            uint8  const id     = fields[2].Get<uint8>();
+            int32  const amount = fields[3].Get<int32>();
+            uint32 const weight = fields[4].Get<uint32>();
 
             auto const slot = StatBonus::SlotOf(kind, id);
             if (!slot)
             {
-                LOG_ERROR("module", "mod-statbonus: quest {} rewards kind {} id {}, which is not a stat, "
-                    "rating, resistance or movement type; skipped.", questId, kind, id);
+                LOG_ERROR("module", "mod-statbonus: {} {} rewards kind {} id {}, which is not a stat, "
+                    "rating, resistance or movement type; skipped.", subject, key, kind, id);
                 ++skipped;
                 continue;
             }
 
             if (StatBonus::IsMovement(*slot) && !StatBonus::IsAdjustableMovement(*slot))
             {
-                LOG_ERROR("module", "mod-statbonus: quest {} rewards {}, which the core does not recalculate, "
-                    "so it could never take effect; skipped.", questId, StatBonus::SlotName(*slot));
+                LOG_ERROR("module", "mod-statbonus: {} {} rewards {}, which the core does not recalculate, "
+                    "so it could never take effect; skipped.", subject, key, StatBonus::SlotName(*slot));
                 ++skipped;
                 continue;
             }
 
-            questRewards[questId].push_back({ *slot, amount, weight });
+            into[key].push_back({ *slot, amount, weight });
             ++rows;
         } while (result->NextRow());
 
-        for (auto const& [questId, pool] : questRewards)
+        for (auto const& [key, pool] : into)
             if (!StatBonus::TotalWeight(pool))
-                LOG_ERROR("module", "mod-statbonus: quest {} has {} reward row(s) and they all have weight 0, "
-                    "so it will grant nothing.", questId, pool.size());
+                LOG_ERROR("module", "mod-statbonus: {} {} has {} reward row(s) and they all have weight 0, "
+                    "so it will grant nothing.", subject, key, pool.size());
 
-        LOG_INFO("module", "mod-statbonus: loaded {} reward row(s) across {} quest(s){}.",
-            rows, questRewards.size(), skipped ? Acore::StringFormat(", skipped {} bad row(s)", skipped) : "");
+        LOG_INFO("module", "mod-statbonus: loaded {} reward row(s) across {} {}(s){}.",
+            rows, into.size(), subject, skipped ? Acore::StringFormat(", skipped {} bad row(s)", skipped) : "");
 
         return rows;
     }
+
+    uint32 LoadItemRewards()
+    {
+        return LoadRewardPool("statbonus_item_reward", "ItemId", "item", itemRewards);
+    }
+
+    uint32 LoadQuestRewards()
+    {
+        return LoadRewardPool("statbonus_quest_reward", "QuestId", "quest", questRewards);
+    }
+
 
     void Persist(uint32 guid, std::size_t slot, int32 amount)
     {
@@ -480,6 +499,7 @@ public:
         {
             LoadBonuses();
             LoadQuestRewards();
+            LoadItemRewards();
         }
     }
 
@@ -487,6 +507,7 @@ public:
     {
         LoadBonuses();
         LoadQuestRewards();
+        LoadItemRewards();
     }
 };
 
@@ -730,6 +751,7 @@ public:
     {
         uint32 const count = LoadBonuses();
         LoadQuestRewards();
+        LoadItemRewards();
 
         // Ratings and resistances are applied state, so a reload has to walk
         // the characters already on and move them to whatever the table says.
@@ -1081,6 +1103,81 @@ public:
     }
 };
 
+// An item that grants its bonus outright, with no quest in the way.
+//
+// The short route: right-click and the bonus is yours. What it grants is a row
+// in statbonus_item_reward rather than anything here, so a new one of these is
+// an item_template row and a reward row - no rebuild - and several rows
+// sharing an ItemId make it a gamble instead of a certainty.
+//
+// The item still has to carry a spell the client knows, for the reason the
+// token does: usability is the client's decision, made out of its own
+// Spell.dbc. That spell is never cast - OnUse returns true, which stops
+// HandleUseItemOpcode before CastItemUseSpell - so it only has to exist, and
+// one with an empty description is worth choosing because the client renders
+// the description as the "Use:" line.
+class StatBonus_GrantItemScript : public ItemScript
+{
+public:
+    StatBonus_GrantItemScript() : ItemScript("item_statbonus_grant") { }
+
+    bool OnUse(Player* player, Item* item, SpellCastTargets const& /*targets*/) override
+    {
+        if (!player || !item)
+            return false;
+
+        // The handler's own warning: a script that stops the cast has to tell
+        // the client, or the item sits greyed out as though still in use.
+        player->SendEquipError(EQUIP_ERR_NONE, item, nullptr);
+
+        if (!cfg.Enable)
+            return true;
+
+        auto const pool = itemRewards.find(item->GetEntry());
+        if (pool == itemRewards.end())
+            return true;
+
+        uint32 const total = StatBonus::TotalWeight(pool->second);
+        if (!total)
+            return true;            // already complained about at load time
+
+        auto const picked = StatBonus::PickByWeight(pool->second, urand(0, total - 1));
+        if (!picked)
+            return true;
+
+        StatBonus::QuestReward const& reward = pool->second[*picked];
+
+        uint32 const guid    = player->GetGUID().GetCounter();
+        bool   const isSpeed = StatBonus::IsMovement(reward.slot);
+        int32  const limit   = isSpeed ? cfg.SpeedLimit : cfg.Limit;
+        int32  const have    = store.Get(guid, reward.slot);
+        int32  const capped  = StatBonus::ClampToLimit(have + reward.amount, limit);
+
+        // Refused rather than wasted. Unlike the quest, where the token has
+        // already been handed over by the time the roll happens, nothing here
+        // is spent until the bonus actually lands - so being at the limit
+        // leaves the item in the bag.
+        if (capped == have)
+        {
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "You are already at the limit for {}, so this was not used.", StatBonus::SlotName(reward.slot));
+            return true;
+        }
+
+        GrantSlot(player, guid, reward.slot, capped);
+        Refresh(player);
+
+        uint32 one = 1;
+        player->DestroyItemCount(item, one, true);
+
+        ChatHandler(player->GetSession()).PSendSysMessage("{}{:+d}{} {}|r - now {:+d}{} in total.",
+            "|cff40ff40", reward.amount, isSpeed ? "%" : "", StatBonus::SlotName(reward.slot),
+            capped, isSpeed ? "%" : "");
+
+        return true;
+    }
+};
+
 void AddStatBonusScripts()
 {
     new StatBonus_WorldScript();
@@ -1088,4 +1185,5 @@ void AddStatBonusScripts()
     new StatBonus_CommandScript();
     new StatBonus_TokenItemScript();
     new StatBonus_GlobalScript();
+    new StatBonus_GrantItemScript();
 }
