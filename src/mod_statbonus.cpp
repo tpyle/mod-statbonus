@@ -1225,8 +1225,8 @@ public:
 // no cast means no packet.
 //
 // So this path does the opposite. The item carries no ItemScript at all, the
-// spell is cast for real with a 3 second cast time, and the bonus lands when
-// the cast completes. Which gets the rest for free:
+// spell is cast for real with a 1.5 second cast time, and the bonus lands
+// when the cast completes. Which gets the rest for free:
 //
 //   - moving or taking damage interrupts it, from the spell's own
 //     InterruptFlags, with nothing spent
@@ -1289,9 +1289,8 @@ class spell_statbonus_grant : public SpellScript
             return;
 
         // The roll CheckCast already made. Re-checking the limit would be
-        // wrong as well as redundant: three seconds is long enough for another
-        // grant to land, and the answer the player was shown is the one to
-        // honour.
+        // wrong as well as redundant: a cast is long enough for another grant
+        // to land, and the answer the player was shown is the one to honour.
         if (auto const& resolved = Roll())
             AwardItemReward(player, *resolved);
     }
