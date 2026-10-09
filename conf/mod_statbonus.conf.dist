@@ -158,11 +158,40 @@ StatBonus.Token.Creatures = ""
 
 #
 #    StatBonus.Token.Chance / .DungeonChance / .HeroicChance / .RaidChance
+#                            / .AnyChance
 #        Description: Drop chances for the token, as a percent rolled per
 #                     player. 0 switches a source off, so there is one dial per
 #                     source and no separate enable.
 #
+#                     Fractions are allowed, and .AnyChance is why: a chance on
+#                     every kill in the world is only useful well below 1%, and
+#                     a whole-number percent could only say 0 or 1.
+#
 #                     .Chance covers the creatures named above.
+#
+#                     .AnyChance covers EVERY OTHER KILL IN THE WORLD, which
+#                     makes it the one dial here that needs thinking about
+#                     before it is turned up:
+#
+#                       0.01   one mote per 10,000 kills
+#                       0.1    one per 1,000 - a long evening's killing
+#                       1      one per 100, which is a mote every few minutes
+#                              and almost certainly not what was meant
+#
+#                     What counts as a kill is the core's own test for whether
+#                     a kill paid experience or honour, rather than a list kept
+#                     here: greys, critters, totems, pets and anything flagged
+#                     NO_XP are all out. So a level 80 cannot farm starter-zone
+#                     wolves, and nothing comes off training dummies or other
+#                     people's minions.
+#
+#                     This one goes to whoever landed the killing blow, and to
+#                     a pet's owner when the pet did, rather than to the group:
+#                     out in the world "the same map" is a whole continent, and
+#                     a party member questing elsewhere on it has no business
+#                     rolling off a kill they were nowhere near. The named
+#                     creatures above still spread to everybody present, which
+#                     is the point of them.
 #
 #                     The other three cover the final boss of anything the
 #                     dungeon finder would pay a random-dungeon bag for. That
@@ -179,12 +208,14 @@ StatBonus.Token.Creatures = ""
 #
 #                     Rolled per player, so a chance below 100 is each person's
 #                     own luck rather than everybody sharing one result.
-#        Default:     100 / 0 / 0 / 0 - (named creatures always, bosses never)
+#        Default:     100 / 0 / 0 / 0 / 0 - (named creatures always, bosses and
+#                     the rest of the world never)
 
 StatBonus.Token.Chance = 100
 StatBonus.Token.DungeonChance = 0
 StatBonus.Token.HeroicChance = 0
 StatBonus.Token.RaidChance = 0
+StatBonus.Token.AnyChance = 0
 
 #
 #    StatBonus.Token.SkipBots

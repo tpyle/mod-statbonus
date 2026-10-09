@@ -125,10 +125,16 @@ namespace
         uint32      TokenCount     = 1;
         // Drop chances, as a percent rolled per player. 0 switches a source
         // off, so there is one dial per source and no separate enable.
-        uint32      TokenChance        = 100;  // the named creatures below
-        uint32      TokenDungeonChance = 0;    // final boss of a normal dungeon
-        uint32      TokenHeroicChance  = 0;    // final boss of a heroic dungeon
-        uint32      TokenRaidChance    = 0;    // final boss of a raid
+        //
+        // Float rather than integer because of AnyChance: a blanket chance on
+        // every kill is only useful well under 1%, and an integer percent
+        // cannot say 0.01 - it can only say 0 or 1, and 1% of every mob on the
+        // realm is a hundred times what anybody meant.
+        float       TokenChance        = 100.0f;  // the named creatures below
+        float       TokenDungeonChance = 0.0f;    // final boss of a normal dungeon
+        float       TokenHeroicChance  = 0.0f;    // final boss of a heroic dungeon
+        float       TokenRaidChance    = 0.0f;    // final boss of a raid
+        float       TokenAnyChance     = 0.0f;    // anything else worth killing
         bool        TokenSkipBots      = true;
         std::string TokenCreatures;        // comma separated creature entries
     };
@@ -201,10 +207,11 @@ namespace
 
         cfg.Quest         = sConfigMgr->GetOption<bool>("StatBonus.Quest.Enable", true);
         cfg.QuestRewards  = sConfigMgr->GetOption<bool>("StatBonus.QuestRewards", true);
-        cfg.TokenChance        = sConfigMgr->GetOption<uint32>("StatBonus.Token.Chance", 100);
-        cfg.TokenDungeonChance = sConfigMgr->GetOption<uint32>("StatBonus.Token.DungeonChance", 0);
-        cfg.TokenHeroicChance  = sConfigMgr->GetOption<uint32>("StatBonus.Token.HeroicChance", 0);
-        cfg.TokenRaidChance    = sConfigMgr->GetOption<uint32>("StatBonus.Token.RaidChance", 0);
+        cfg.TokenChance        = sConfigMgr->GetOption<float>("StatBonus.Token.Chance", 100.0f);
+        cfg.TokenDungeonChance = sConfigMgr->GetOption<float>("StatBonus.Token.DungeonChance", 0.0f);
+        cfg.TokenHeroicChance  = sConfigMgr->GetOption<float>("StatBonus.Token.HeroicChance", 0.0f);
+        cfg.TokenRaidChance    = sConfigMgr->GetOption<float>("StatBonus.Token.RaidChance", 0.0f);
+        cfg.TokenAnyChance     = sConfigMgr->GetOption<float>("StatBonus.Token.AnyChance", 0.0f);
         cfg.TokenSkipBots      = sConfigMgr->GetOption<bool>("StatBonus.Token.SkipBots", true);
         cfg.BrokerEntry   = sConfigMgr->GetOption<uint32>("StatBonus.Broker.Entry", 0);
         cfg.BrokerSeconds = sConfigMgr->GetOption<uint32>("StatBonus.Broker.DespawnSeconds", 120);
@@ -405,18 +412,40 @@ namespace
     // Rolled per player rather than once for the group, so a chance below 100
     // means each person's own luck rather than everybody sharing one result.
     // At 100 this is the old behaviour exactly.
-    void MaybeGiveToken(Player* player, uint32 chance)
+    //
+    // The bot check comes before the roll, not after: with a blanket chance
+    // this runs on every kill on the realm, and 500 bots are nearly all of
+    // them.
+    void MaybeGiveToken(Player* player, float chance)
     {
-        if (!player || !chance)
+        if (!player || chance <= 0.0f)
             return;
 
         if (cfg.TokenSkipBots && IsBot(player))
             return;             // a bot would never use it or turn it in
 
-        if (chance < 100 && urand(1, 100) > chance)
+        if (chance < 100.0f && !roll_chance_f(chance))
             return;
 
         GiveToken(player);
+    }
+
+    // Does this kill get the blanket roll?
+    //
+    // isHonorOrXPTarget is the core's own answer to "did that kill count",
+    // used for experience and honour, and it is the right one to borrow rather
+    // than write a list of exclusions by hand: it rejects greys, critters,
+    // totems, pets and anything flagged NO_XP. So a level 80 cannot farm
+    // starter-zone wolves, and nobody earns motes off training dummies or
+    // somebody else's minions.
+    //
+    // It reads the level the victim presents to this player, which on this
+    // realm is the scaled one - so a mob worth fighting counts whatever its
+    // row says, and the dial means what it says across the whole world rather
+    // than only in the zones a character has outgrown.
+    bool EligibleForAnyChance(Player* killer, Creature* killed)
+    {
+        return killer && killed && cfg.TokenAnyChance > 0.0f && killer->isHonorOrXPTarget(killed);
     }
 
     // Reads one reward-pool table. Shared by the quest and item pools, which
@@ -576,6 +605,7 @@ public:
             PLAYERHOOK_ON_QUEST_OFFER_REWARD_TEXT,
             PLAYERHOOK_ON_PLAYER_QUEST_ACCEPT,
             PLAYERHOOK_ON_CREATURE_KILL,
+            PLAYERHOOK_ON_CREATURE_KILLED_BY_PET,
             PLAYERHOOK_ON_LOGIN,
             PLAYERHOOK_ON_LOGOUT
         }) { }
@@ -721,13 +751,28 @@ public:
     // quest, and an ordinary item drops once for one looter. Handing it over
     // here gives every group member in the instance a copy whether or not they
     // have the quest, which is what makes the thing repeatable in company.
+    //
+    // TWO DIFFERENT SOURCES MEET HERE, and they spread differently on purpose:
+    //
+    //   a named creature  .Chance     every group member on the map
+    //   anything else     .AnyChance  whoever landed the killing blow
+    //
+    // The named ones are the set-piece kill the group came for, so everybody
+    // present shares it. The blanket chance is an ordinary mob dying somewhere
+    // in the world, where "on the map" means the whole continent - a party
+    // member questing in Tanaris has no business rolling off a kill in Elwynn,
+    // so that one stays with the killer.
     void OnPlayerCreatureKill(Player* killer, Creature* killed) override
     {
         if (!cfg.Enable || cfg.TokenItems.empty() || !killer || !killed)
             return;
 
         if (!tokenCreatures.count(killed->GetEntry()))
+        {
+            if (EligibleForAnyChance(killer, killed))
+                MaybeGiveToken(killer, cfg.TokenAnyChance);
             return;
+        }
 
         Group* group = killer->GetGroup();
         if (!group)
@@ -740,6 +785,26 @@ public:
             if (Player* member = itr->GetSource())
                 if (member->GetMap() == killed->GetMap())
                     MaybeGiveToken(member, cfg.TokenChance);
+    }
+
+    // The same blanket roll when a pet landed the killing blow.
+    //
+    // OnPlayerCreatureKill only fires when the killer IS the player: the core
+    // sends a pet's kill down a separate hook, and without this a hunter, a
+    // warlock or an unholy death knight would be cut out of a world-wide drop
+    // most of the time. The named-creature path is left alone, because that
+    // one spreads to the whole group anyway and so does not care who swung
+    // last.
+    void OnPlayerCreatureKilledByPet(Player* petOwner, Creature* killed) override
+    {
+        if (!cfg.Enable || cfg.TokenItems.empty() || !petOwner || !killed)
+            return;
+
+        if (tokenCreatures.count(killed->GetEntry()))
+            return;             // handled by the group path above
+
+        if (EligibleForAnyChance(petOwner, killed))
+            MaybeGiveToken(petOwner, cfg.TokenAnyChance);
     }
 
     // The broker, called up when the quest is taken.
@@ -1149,7 +1214,7 @@ public:
         if (!dungeon)
             return;
 
-        uint32 chance = 0;
+        float chance = 0.0f;
         switch (dungeon->type)
         {
             case lfg::LFG_TYPE_DUNGEON:
@@ -1165,7 +1230,7 @@ public:
                 return;
         }
 
-        if (!chance)
+        if (chance <= 0.0f)
             return;
 
         // Everybody on the map, not everybody in the group: inside an instance
