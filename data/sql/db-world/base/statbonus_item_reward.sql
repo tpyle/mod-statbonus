@@ -20,18 +20,37 @@
 -- grants nothing and says so in the log, rather than quietly falling back to
 -- the first row.
 --
--- An item listed here needs two things in item_template to work:
+-- An item listed here always needs this much in item_template:
 --
---   ScriptName = 'item_statbonus_grant'   so the use is intercepted
---   spellid_1  = <a spell the CLIENT knows>, spelltrigger_1 = 0
+--   spellid_1 = <a spell the CLIENT knows>, spelltrigger_1 = 0
 --
--- The second is not optional and not cosmetic. Whether an item is usable at
--- all - the "Use:" line and whether right-clicking sends anything - is decided
--- by the client out of its own Spell.dbc, so an item with no spell, or with a
+-- That is not optional and not cosmetic. Whether an item is usable at all -
+-- the "Use:" line and whether right-clicking sends anything - is decided by
+-- the client out of its own Spell.dbc, so an item with no spell, or with a
 -- spell that exists only in the spell_dbc world table, shows no Use: line and
--- right-clicks into nothing. The script returns true, so that spell is never
--- actually cast and only has to exist. One with an empty description is worth
--- picking, because the client renders the description as the Use: line.
+-- right-clicks into nothing. The client renders that spell's DESCRIPTION as
+-- the Use: line, so the spell is also where the wording comes from.
+--
+-- Then pick which of the two grant paths it uses:
+--
+--   INSTANT   item_template.ScriptName = 'item_statbonus_grant'
+--             The ItemScript returns true from OnUse, which stops
+--             HandleUseItemOpcode before the spell is cast. Nothing is cast,
+--             so the spell only has to exist - and so there can be no cast
+--             bar. The script spends the item itself; leave spellcharges_1
+--             at 0 or the two will both try.
+--
+--   CAST BAR  no ScriptName, spellcharges_1 = -1, and a spell_script_names
+--             row binding the spell to 'spell_statbonus_grant'
+--             The spell is cast for real, so the client draws a bar for
+--             whatever the spell's CastingTimeIndex says and its
+--             InterruptFlags decide what cancels it. The bonus lands when the
+--             cast completes, and the core spends the item in
+--             Spell::TakeCastItem at the end of Spell::cast - after the
+--             effects - so an interrupted cast costs nothing.
+--
+-- Both read this table and share the roll, the limit check and the wording, so
+-- the choice is only about how it feels to use.
 --
 -- The rows themselves are realm content and live in the realm's own SQL, not
 -- here: this file is the mechanism.

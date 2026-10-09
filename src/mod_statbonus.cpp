@@ -83,6 +83,7 @@
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
 #include "SpellInfo.h"
+#include "SpellScript.h"
 #include "SpellMgr.h"
 #include "StringFormat.h"
 #include "Tokenize.h"
@@ -1103,6 +1104,66 @@ public:
     }
 };
 
+// What an item's use would grant, and whether it can land.
+//
+// Shared by the two grant paths below - the instant one and the one with a
+// cast bar - because they differ only in WHEN they do this, and a second copy
+// of a weighted roll plus a limit check is a second thing to keep in step.
+//
+// Returns nothing when there is nothing to give. `atLimit` separates "this
+// item grants nothing" from "it grants something you cannot hold any more
+// of", which the caller has to tell apart: one is a broken item and the other
+// is a full character.
+struct ResolvedReward
+{
+    StatBonus::QuestReward reward{};
+    int32 total   = 0;          // what the slot would hold afterwards
+    bool  atLimit = false;      // already capped, so using this would waste it
+};
+
+std::optional<ResolvedReward> ResolveItemReward(Player* player, uint32 itemEntry)
+{
+    if (!player || !cfg.Enable)
+        return std::nullopt;
+
+    auto const pool = itemRewards.find(itemEntry);
+    if (pool == itemRewards.end())
+        return std::nullopt;
+
+    uint32 const total = StatBonus::TotalWeight(pool->second);
+    if (!total)
+        return std::nullopt;        // already complained about at load time
+
+    auto const picked = StatBonus::PickByWeight(pool->second, urand(0, total - 1));
+    if (!picked)
+        return std::nullopt;
+
+    ResolvedReward out;
+    out.reward = pool->second[*picked];
+
+    uint32 const guid   = player->GetGUID().GetCounter();
+    bool   const isSpeed = StatBonus::IsMovement(out.reward.slot);
+    int32  const limit  = isSpeed ? cfg.SpeedLimit : cfg.Limit;
+    int32  const have   = store.Get(guid, out.reward.slot);
+
+    out.total   = StatBonus::ClampToLimit(have + out.reward.amount, limit);
+    out.atLimit = out.total == have;
+    return out;
+}
+
+// Hand the bonus over and say so, in the wording both paths share.
+void AwardItemReward(Player* player, ResolvedReward const& resolved)
+{
+    bool const isSpeed = StatBonus::IsMovement(resolved.reward.slot);
+
+    GrantSlot(player, player->GetGUID().GetCounter(), resolved.reward.slot, resolved.total);
+    Refresh(player);
+
+    ChatHandler(player->GetSession()).PSendSysMessage("{}{:+d}{} {}|r - now {:+d}{} in total.",
+        "|cff40ff40", resolved.reward.amount, isSpeed ? "%" : "", StatBonus::SlotName(resolved.reward.slot),
+        resolved.total, isSpeed ? "%" : "");
+}
+
 // An item that grants its bonus outright, with no quest in the way.
 //
 // The short route: right-click and the bonus is yours. What it grants is a row
@@ -1130,51 +1191,115 @@ public:
         // the client, or the item sits greyed out as though still in use.
         player->SendEquipError(EQUIP_ERR_NONE, item, nullptr);
 
-        if (!cfg.Enable)
+        auto const resolved = ResolveItemReward(player, item->GetEntry());
+        if (!resolved)
             return true;
-
-        auto const pool = itemRewards.find(item->GetEntry());
-        if (pool == itemRewards.end())
-            return true;
-
-        uint32 const total = StatBonus::TotalWeight(pool->second);
-        if (!total)
-            return true;            // already complained about at load time
-
-        auto const picked = StatBonus::PickByWeight(pool->second, urand(0, total - 1));
-        if (!picked)
-            return true;
-
-        StatBonus::QuestReward const& reward = pool->second[*picked];
-
-        uint32 const guid    = player->GetGUID().GetCounter();
-        bool   const isSpeed = StatBonus::IsMovement(reward.slot);
-        int32  const limit   = isSpeed ? cfg.SpeedLimit : cfg.Limit;
-        int32  const have    = store.Get(guid, reward.slot);
-        int32  const capped  = StatBonus::ClampToLimit(have + reward.amount, limit);
 
         // Refused rather than wasted. Unlike the quest, where the token has
         // already been handed over by the time the roll happens, nothing here
         // is spent until the bonus actually lands - so being at the limit
         // leaves the item in the bag.
-        if (capped == have)
+        if (resolved->atLimit)
         {
             ChatHandler(player->GetSession()).PSendSysMessage(
-                "You are already at the limit for {}, so this was not used.", StatBonus::SlotName(reward.slot));
+                "You are already at the limit for {}, so this was not used.",
+                StatBonus::SlotName(resolved->reward.slot));
             return true;
         }
 
-        GrantSlot(player, guid, reward.slot, capped);
-        Refresh(player);
+        AwardItemReward(player, *resolved);
 
         uint32 one = 1;
         player->DestroyItemCount(item, one, true);
 
-        ChatHandler(player->GetSession()).PSendSysMessage("{}{:+d}{} {}|r - now {:+d}{} in total.",
-            "|cff40ff40", reward.amount, isSpeed ? "%" : "", StatBonus::SlotName(reward.slot),
-            capped, isSpeed ? "%" : "");
-
         return true;
+    }
+};
+
+// The same grant, but with a cast bar, the way disenchanting has one.
+//
+// The instant path above works by NOT casting: ItemScript::OnUse returns true,
+// which stops HandleUseItemOpcode before CastItemUseSpell, so the item's spell
+// exists only to make the client draw a "Use:" line. That is also why it can
+// never show a cast bar - the bar is the client drawing SMSG_SPELL_START, and
+// no cast means no packet.
+//
+// So this path does the opposite. The item carries no ItemScript at all, the
+// spell is cast for real with a 3 second cast time, and the bonus lands when
+// the cast completes. Which gets the rest for free:
+//
+//   - moving or taking damage interrupts it, from the spell's own
+//     InterruptFlags, with nothing spent
+//   - the item is consumed by the core from spellcharges_1 = -1 in
+//     Spell::TakeCastItem, which runs at the END of Spell::cast, after the
+//     effects - so an interrupted cast costs nothing either
+//
+// Bound by spell_script_names rather than by item, so which spell a mote
+// carries is what decides whether it is instant or has a bar.
+class spell_statbonus_grant : public SpellScript
+{
+    PrepareSpellScript(spell_statbonus_grant);
+
+    // Rolled once and remembered, because CheckCast runs more than once for a
+    // timed cast - at prepare and again when it finishes - and a gamble that
+    // re-rolled between them could refuse one stat and then award another.
+    std::optional<ResolvedReward> _resolved;
+    bool _rolled = false;
+
+    std::optional<ResolvedReward> const& Roll()
+    {
+        if (!_rolled)
+        {
+            _rolled = true;
+            if (Item* item = GetCastItem())
+                if (Player* player = GetCaster()->ToPlayer())
+                    _resolved = ResolveItemReward(player, item->GetEntry());
+        }
+        return _resolved;
+    }
+
+    SpellCastResult CheckCast()
+    {
+        Player* player = GetCaster() ? GetCaster()->ToPlayer() : nullptr;
+        if (!player)
+            return SPELL_FAILED_DONT_REPORT;
+
+        auto const& resolved = Roll();
+        if (!resolved)
+            return SPELL_FAILED_DONT_REPORT;    // nothing to give; stay quiet
+
+        // Checked here and not at the effect, so a character who is already
+        // capped never starts the cast and still has the item afterwards. The
+        // red client error is suppressed in favour of saying which stat it was.
+        if (resolved->atLimit)
+        {
+            ChatHandler(player->GetSession()).PSendSysMessage(
+                "You are already at the limit for {}, so this was not used.",
+                StatBonus::SlotName(resolved->reward.slot));
+            return SPELL_FAILED_DONT_REPORT;
+        }
+
+        return SPELL_CAST_OK;
+    }
+
+    void HandleDummy(SpellEffIndex /*effIndex*/)
+    {
+        Player* player = GetCaster() ? GetCaster()->ToPlayer() : nullptr;
+        if (!player)
+            return;
+
+        // The roll CheckCast already made. Re-checking the limit would be
+        // wrong as well as redundant: three seconds is long enough for another
+        // grant to land, and the answer the player was shown is the one to
+        // honour.
+        if (auto const& resolved = Roll())
+            AwardItemReward(player, *resolved);
+    }
+
+    void Register() override
+    {
+        OnCheckCast += SpellCheckCastFn(spell_statbonus_grant::CheckCast);
+        OnEffectHit += SpellEffectFn(spell_statbonus_grant::HandleDummy, EFFECT_0, SPELL_EFFECT_DUMMY);
     }
 };
 
@@ -1186,4 +1311,5 @@ void AddStatBonusScripts()
     new StatBonus_TokenItemScript();
     new StatBonus_GlobalScript();
     new StatBonus_GrantItemScript();
+    RegisterSpellScript(spell_statbonus_grant);
 }
