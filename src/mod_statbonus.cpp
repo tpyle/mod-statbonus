@@ -78,6 +78,7 @@
 #include "Language.h"
 #include "Log.h"
 #include "ObjectAccessor.h"
+#include "ObjectMgr.h"
 #include "Player.h"
 #include "QuestDef.h"
 #include "ScriptMgr.h"
@@ -448,6 +449,52 @@ namespace
         return killer && killed && cfg.TokenAnyChance > 0.0f && killer->isHonorOrXPTarget(killed);
     }
 
+    // What the handout is actually set to, said out loud at startup.
+    //
+    // It exists because the silent failure here is a plausible one: an item
+    // entry that parses perfectly and does not exist. Nothing else would ever
+    // mention it - the roll succeeds, Item::CreateItem returns nothing, and
+    // the player simply never sees a drop, which is indistinguishable from bad
+    // luck at a fraction of a percent. Checking the entries needs
+    // item_template, so this runs from OnStartup rather than from the config
+    // load, where the world database is not up yet.
+    //
+    // The chances go in the same line because they are the other half of the
+    // same question - the config file says what was asked for, and this says
+    // what the server understood, which is the thing worth being able to grep
+    // for after a reload.
+    void LogTokenSetup()
+    {
+        if (cfg.TokenItems.empty())
+        {
+            LOG_INFO("module", "mod-statbonus: no token items configured, so kills hand out nothing");
+            return;
+        }
+
+        std::string named;
+        for (uint32 const entry : cfg.TokenItems)
+        {
+            ItemTemplate const* tmpl = sObjectMgr->GetItemTemplate(entry);
+
+            if (!tmpl)
+                LOG_ERROR("module", "mod-statbonus: item {} in StatBonus.Token.Items does not exist, "
+                    "so a roll that picks it hands out nothing", entry);
+
+            if (!named.empty())
+                named.append(", ");
+
+            named.append(Acore::StringFormat("{} ({})", entry, tmpl ? tmpl->Name1 : "MISSING"));
+        }
+
+        // One roll picks one of them, which is the part worth restating here:
+        // the percentages are the chance of getting AN item, not of each.
+        LOG_INFO("module", "mod-statbonus: kills hand out one of {} - named {}%, dungeon {}%, heroic {}%, "
+            "raid {}%, anything else {}%{}",
+            named, cfg.TokenChance, cfg.TokenDungeonChance, cfg.TokenHeroicChance,
+            cfg.TokenRaidChance, cfg.TokenAnyChance,
+            cfg.TokenSkipBots ? " (bots skipped)" : "");
+    }
+
     // Reads one reward-pool table. Shared by the quest and item pools, which
     // differ only in the table and the word used when complaining about a bad
     // row - and a copy of this would be the obvious place for the two to drift.
@@ -583,6 +630,7 @@ public:
             LoadBonuses();
             LoadQuestRewards();
             LoadItemRewards();
+            LogTokenSetup();
         }
     }
 
@@ -591,6 +639,7 @@ public:
         LoadBonuses();
         LoadQuestRewards();
         LoadItemRewards();
+        LogTokenSetup();
     }
 };
 
